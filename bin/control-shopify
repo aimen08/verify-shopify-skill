@@ -1,0 +1,3 @@
+#!/bin/sh
+# Thin launcher so agents can type `control-shopify …` from any repo.
+exec node "$HOME/.claude/skills/verify-shopify/control-shopify.mjs" "$@"
