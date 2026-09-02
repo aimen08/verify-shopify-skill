@@ -1,105 +1,66 @@
-# verify-shopify — a Claude Code verification skill for Shopify themes
+# verify-shopify
 
-A [pstack](https://cursor.com/marketplace/cursor/pstack)-style verification loop for Shopify theme work, packaged as a Claude Code skill. One CLI, `control-shopify`, lets an agent close its own loop on any store:
+A Claude Code skill that closes the loop on Shopify theme work:
 
-**edit → `shopify theme dev` → drive the storefront in real Chromium → screenshots / video / console → theme check + Liquid profile → report.**
+**edit → `shopify theme dev` → assert the real DOM in Chromium → look at it → report.**
 
-- Browser driver: [agent-browser](https://www.npmjs.com/package/agent-browser) (real Chromium via CDP, accessibility-tree snapshots with `@eN` refs, isolated session per store).
-- Store access: Shopify CLI `theme dev`, `theme check`, `theme profile`, and the Admin GraphQL API through `shopify store auth` / `shopify store execute` (products, inventory, publications, files, navigation menus).
-- Store-agnostic: each repo points at its store with `.claude/verify-shopify.json`; the theme-specific Feature Map lives in the repo next to it.
+One CLI, `control-shopify`, wraps the whole thing. It is store-agnostic — each repo points at its store with `.claude/verify-shopify.json`.
+
+- Browser: a real Chromium via [agent-browser](https://www.npmjs.com/package/agent-browser), one isolated session per store.
+- Store access: Shopify CLI `theme dev`, `theme check`, and the Admin GraphQL API through `shopify store auth` / `shopify store execute`.
+- Output: every command prints JSON, so an agent can branch on it. Failures carry a `hint`.
 
 ## Install
 
 ```bash
-# 1. Skill (the launcher assumes this exact path)
+npm i -g @shopify/cli agent-browser && agent-browser install
 git clone git@github.com:aimen08/verify-shopify-skill.git ~/.claude/skills/verify-shopify
-
-# 2. Tools
-npm i -g @shopify/cli agent-browser
-agent-browser install
-
-# 3. Put `control-shopify` on PATH
-ln -sf ~/.claude/skills/verify-shopify/bin/control-shopify "$(npm prefix -g)/bin/control-shopify"
-control-shopify help
+ln -s ~/.claude/skills/verify-shopify/bin/control-shopify /usr/local/bin/control-shopify
 ```
 
-Fallback without the symlink: `node ~/.claude/skills/verify-shopify/control-shopify.mjs <command>`.
-
-## Set up a store repo
+## Use
 
 ```bash
-cd <theme repo>
-control-shopify init --store <shop>.myshopify.com     # writes .claude/verify-shopify.json + features/ skeleton
-control-shopify doctor                                 # node, shopify CLI, agent-browser, token + scopes, dev server
-control-shopify auth                                   # interactive OAuth, only if doctor reports missing scopes
-control-shopify map                                    # generated Feature Map skeleton from the theme files
-```
-
-Then in Claude Code, type `/verify-shopify` (or just ask it to verify a theme change) — `SKILL.md` teaches the agent the loop, the evidence rules, and the gotchas.
-
-## The loop
-
-Write each surface's expectations down once as a **spec**, then verify it in one command:
-
-```bash
+control-shopify init --store <shop>.myshopify.com --port 9292 --gitignore
+control-shopify doctor
 control-shopify dev start
-control-shopify verify home --screenshot   # open → wait → assert → check-page → screenshot, one JSON verdict
-control-shopify smoke --target preview     # every configured route
+
+control-shopify verify <spec> --screenshot     # open → wait → assert → check-page → PNG
+control-shopify verify --all                   # every spec, as a regression suite
+control-shopify cleanup --keep-dev
 ```
 
-`.claude/verify-shopify/specs/home.json`:
+The unit of work is a **spec** — JSON at `.claude/verify-shopify/specs/<name>.json` describing a route and what must be true on it:
 
-```json
+```jsonc
 {
-  "route": "/",
-  "waitFn": "!document.documentElement.hasAttribute('data-cz-intro')",
+  "route": "/products/some-handle",
+  "country": "US",
   "checks": [
-    { "name": "hero eyebrow is centred", "selector": ".hero .eyebrow", "centeredIn": ".hero", "tolerance": 2 },
-    { "name": "marquee actually moves",  "selector": ".marquee", "animating": true },
-    { "name": "og:image", "selector": "meta[property=\"og:image\"]", "attr": "content", "contains": "social-card" },
-    { "name": "5 cards", "selector": "li.card", "count": 5 }
+    { "name": "3 bundle items", "selector": "#bundle .item", "count": 3 },
+    { "name": "CTA copy", "selector": ".btn", "textContains": "ADD ALL 3" }
   ]
 }
 ```
 
-Checks: `exists`, `count`/`minCount`, `visible`, `textContains`/`textNotContains`/`textEquals`, `attr`+`equals`/`contains`, `css`, `centeredIn`+`tolerance`, `animating`. They all run in a single round trip, each independently try/caught, and `verify` exits 1 if any fails. `centeredIn` and `animating` exist because a screenshot cannot distinguish a centred element from a left-aligned one inside a centred box, nor a moving marquee from a still one.
+Specs are the point: they are cheap to write, they cannot "pass" on a 502 page, and they stay behind as regression tests.
 
-Lower-level commands, for debugging or exploring a surface before it has a spec:
+## Design
 
-```bash
-control-shopify open /products/<handle>   # retries the dev proxy's intermittent 502 / 401 pages
-control-shopify snapshot                  # a11y tree with @eN refs
-control-shopify click @e12
-control-shopify wait --text "Added"
-control-shopify screenshot                # → .shopify/verify/evidence/<ts>-<title>.png
-control-shopify check-page                # 502? empty? broken images? uncaught errors?
-control-shopify smoke                     # every configured route → report.{json,md} + screenshots
-control-shopify check                     # shopify theme check as JSON
-control-shopify profile /                 # Liquid render profile + self-time summary
-control-shopify cleanup --keep-dev
-```
+The skill is deliberately small. Earlier versions shipped video recording, Liquid profiling, a Feature Map generator, route smoke-tests, cart helpers and handle lookups; in practice the loop is **`gql` to find fixtures → `verify` to assert → `eval` to explain a failure → one screenshot to look at it**, and everything else was surface area that cost context without earning it. Commands were removed rather than left undocumented.
 
-Targets: `--target dev` (local proxy, fast), `--target preview` (`?preview_theme_id=` on the real domain — use for hand-over screenshots), `--target live`.
-
-## Layout
+Screenshots are kept, with a rule: take one per surface *and read it*. DOM checks tell you pass/fail; only the picture tells you the page looks right.
 
 ```
-SKILL.md                    the skill: setup, loop, command reference, recipes, gotchas, maintenance
-control-shopify.mjs         the CLI (Node ≥ 20, zero dependencies)
-bin/control-shopify         launcher
+SKILL.md                    the skill itself — setup, the loop, spec vocabulary, gotchas
+control-shopify.mjs         the CLI
 references/
-  browser-tooling.md        why agent-browser; obscura / Chrome MCP comparison; headless-Chrome fallback
-  storefront-routes.md      Shopify routes, AJAX cart endpoints, Section Rendering API, preview/editor
-  admin-api.md              scopes and GraphQL recipes (menus, publications, files, inventory, pages)
+  storefront-routes.md      Shopify routes, AJAX cart endpoints, Section Rendering API
+  admin-api.md              scopes + GraphQL recipes
   feature-map-template.md   format for per-store Feature Maps
+  browser-tooling.md        why agent-browser; headless-Chrome fallback
 ```
 
-Per-repo files (not in this repo): `.claude/verify-shopify.json`, `.claude/verify-shopify/features/*.md`, `.claude/verify-shopify/specs/*.json`, and state/evidence under `.shopify/verify/` (gitignore `.shopify/`).
+## Maintaining
 
-## Working on several stores at once
-
-Give every repo its own `port` in `.claude/verify-shopify.json`. `dev start`, `dev status` and `doctor` refuse a server whose inlined `Shopify.shop` is not the configured store, so another project's `shopify theme dev` on the same port fails loudly instead of being screenshotted and reported as yours.
-
-## Maintain
-
-Weekly, or after any surprise: `doctor` → `map` and diff against the hand-written Feature Map → `smoke --target preview` → add gotchas. If you worked around a command by hand, fix the command.
+After any surprise: `doctor` → re-run `verify --all` → add the gotcha to `SKILL.md` and the store's Feature Map. If you worked around a command by hand, fix the command — agents should run a CLI command, not write throwaway scripts.

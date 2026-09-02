@@ -3,7 +3,7 @@
 //
 // One binary that knows how to: run `shopify theme dev`, drive the storefront in a
 // real Chromium (agent-browser), collect evidence (screenshots / video / console),
-// lint + profile the theme, and talk to the Admin GraphQL API via `shopify store`.
+// lint the theme, and talk to the Admin GraphQL API via `shopify store`.
 //
 // Zero dependencies. Node >= 20. Every structured command prints JSON on stdout;
 // failures print {"ok":false,"error":..,"hint":..} on stderr and exit 1.
@@ -16,16 +16,20 @@ import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.1.0';
+const VERSION = '2.0.0';
 const SKILL_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_PORT = 9292;
+// Only what verification actually reads: fixtures (products/inventory/locations), theme files for
+// the "does this theme carry my code" md5 proof, and pages behind page.<suffix> templates. Keep this
+// list minimal -- `shopify store auth` REPLACES the token's scopes, so asking for extras can silently
+// drop scopes the user granted for other work.
 const DEFAULT_SCOPES = [
-  'write_products', 'read_products',
-  'write_inventory', 'read_inventory', 'read_locations',
-  'write_publications', 'write_files', 'write_purchase_options',
-  'read_online_store_navigation', 'write_online_store_navigation',
-  'write_content',
+  'read_products', 'write_products',
+  'read_inventory', 'write_inventory', 'read_locations',
+  'read_files', 'write_files',
+  'read_content', 'write_content',
+  'read_themes',
 ];
 const DEFAULT_ROUTES = [
   '/', '/collections/all', '/collections/{collection}', '/products/{product}',
@@ -40,10 +44,10 @@ const PASSTHROUGH = new Set([
   'snapshot', 'click', 'dblclick', 'fill', 'type', 'press', 'keyboard', 'hover', 'focus',
   'check', 'uncheck', 'select', 'drag', 'upload', 'download', 'scroll', 'scrollintoview',
   'wait', 'eval', 'get', 'is', 'find', 'mouse', 'set', 'network', 'cookies', 'storage',
-  'tab', 'back', 'forward', 'reload', 'diff', 'trace', 'profiler', 'record', 'console',
+  'tab', 'back', 'forward', 'reload', 'diff', 'console',
   'errors', 'highlight', 'read', 'dialog', 'pdf', 'inspect', 'session', 'close',
 ]);
-const GLOBAL_VALUE_FLAGS = ['store', 'port', 'target', 'session', 'theme', 'cwd', 'timeout'];
+const GLOBAL_VALUE_FLAGS = ['store', 'port', 'target', 'session', 'theme', 'cwd', 'timeout', 'country'];
 const GLOBAL_BOOL_FLAGS = ['dry-run', 'json', 'headed', 'verbose', 'strict', 'keep-dev'];
 
 // ---------------------------------------------------------------- utilities
@@ -145,6 +149,7 @@ function buildContext(globals) {
       || (devState && devState.themeId && (!devState.store || normalizeStore(devState.store) === store) ? devState.themeId : null)
       || config.themeId || null,
     target: globals.target || config.defaultTarget || 'dev',
+    country: globals.country || config.country || null,
     primaryDomain: config.primaryDomain || storeState.primaryDomain || null,
     storePassword: process.env[passwordEnv] || config.storePassword || null,
     scopes: config.scopes || DEFAULT_SCOPES,
@@ -202,6 +207,7 @@ function cmdInit(ctx, rest) {
     defaultTarget: 'dev',
     scopes: DEFAULT_SCOPES,
     routes: DEFAULT_ROUTES,
+    country: null,
     consoleNoise: [],
     featureMap: '.claude/verify-shopify/features/README.md',
   };
@@ -210,7 +216,7 @@ function cmdInit(ctx, rest) {
   fs.mkdirSync(featuresDir, { recursive: true });
   const readme = path.join(featuresDir, 'README.md');
   if (!fs.existsSync(readme)) {
-    fs.writeFileSync(readme, `# Feature Map — ${store}\n\nNot written yet. Run \`control-shopify map\` for a generated skeleton, then follow\n"Building a Feature Map" in ~/.claude/skills/verify-shopify/SKILL.md.\n`);
+    fs.writeFileSync(readme, `# Feature Map — ${store}\n\nNot written yet. Record only what you had to discover: selectors, click paths, and\ngotchas. See "Feature Map" in ~/.claude/skills/verify-shopify/SKILL.md.\n`);
   }
   const gi = path.join(ctx.root, '.gitignore');
   const giText = fs.existsSync(gi) ? fs.readFileSync(gi, 'utf8') : '';
@@ -243,7 +249,23 @@ function cmdDoctor(ctx) {
   const checks = {};
   checks.node = { ok: Number(process.versions.node.split('.')[0]) >= 20, version: process.versions.node };
   const sv = run('shopify', ['version'], { timeout: 30000 });
-  checks.shopifyCli = { ok: !sv.missing && sv.code === 0, version: stripAnsi(sv.stdout).trim().split('\n').pop(), hint: sv.missing ? 'npm i -g @shopify/cli' : undefined };
+  // Several installs (npm / bun / homebrew) routinely shadow each other, and a version pin applied
+  // to one while another wins PATH is invisible until a command misbehaves. Report what RUNS.
+  const paths = run('sh', ['-c', 'command -v -a shopify || which -a shopify'], { timeout: 15000 }).stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  const shadowed = [...new Set(paths)];
+  checks.shopifyCli = { ok: !sv.missing && sv.code === 0, version: stripAnsi(sv.stdout).trim().split('\n').pop(),
+    path: shadowed[0] || null, shadowedBy: shadowed.length > 1 ? shadowed.slice(1) : undefined,
+    hint: sv.missing ? 'npm i -g @shopify/cli'
+      : shadowed.length > 1 ? `${shadowed.length} shopify installs on PATH; ${shadowed[0]} wins. Version pins applied to the others have no effect.`
+      : undefined };
+  // `theme` commands use a session distinct from the `store execute` token. When it expires the CLI
+  // starts a device-code OAuth and, with nobody at the browser, dies with "The operation was
+  // aborted" — which reads like a hard breakage and sends you off building live-only workarounds.
+  const tl = run('shopify', ['theme', 'list', ...(ctx.store ? ['--store', ctx.store] : [])], { timeout: 25000 });
+  const tlText = stripAnsi(tl.stdout + tl.stderr);
+  const needsLogin = /log in to Shopify|operation was aborted|verification code/i.test(tlText) || tl.code !== 0;
+  checks.themeSession = { ok: !needsLogin,
+    hint: needsLogin ? `theme session expired — ask the user to run this once interactively: \`! shopify theme list --store ${ctx.store || '<shop>'}\` (it needs a browser; a non-TTY agent shell cannot complete the device-code login). \`gql\` keeps working meanwhile.` : undefined };
   const av = run('agent-browser', ['--version'], { timeout: 30000 });
   checks.agentBrowser = { ok: !av.missing && av.code === 0, version: stripAnsi(av.stdout).trim(), hint: av.missing ? 'npm i -g agent-browser && agent-browser install' : undefined };
   checks.config = { ok: fs.existsSync(ctx.configFile), file: ctx.configFile, store: ctx.store, hint: fs.existsSync(ctx.configFile) ? undefined : 'control-shopify init --store <shop>.myshopify.com' };
@@ -273,7 +295,7 @@ function cmdDoctor(ctx) {
     }
   } else checks.storeAuth = { ok: false, hint: 'no store configured' };
   const fm = path.join(ctx.root, ctx.config.featureMap || '.claude/verify-shopify/features/README.md');
-  checks.featureMap = { ok: fs.existsSync(fm) && fs.readFileSync(fm, 'utf8').length > 300, file: fm, hint: fs.existsSync(fm) ? undefined : 'control-shopify map, then write the Feature Map' };
+  checks.featureMap = { ok: fs.existsSync(fm) && fs.readFileSync(fm, 'utf8').length > 300, file: fm, hint: fs.existsSync(fm) ? undefined : `write the Feature Map at ${fm} — selectors, click paths and gotchas only` };
   const ok = Object.values(checks).every((c) => c.ok);
   out({ ok, checks });
   if (!ok) process.exit(1);
@@ -330,7 +352,7 @@ function identifyServer(url, attempts = 3) {
 }
 function discoverTheme(url, attempts = 3) { return identifyServer(url, attempts).theme; }
 // Refuse to use a dev server that is serving somebody else's store. Without this every screenshot,
-// assertion and smoke row silently describes the wrong storefront -- and a foreign theme id gets
+// assertion silently describes the wrong storefront -- and a foreign theme id gets
 // persisted into .shopify/verify/dev.json, which then breaks the next real `dev start`.
 function assertOwnServer(ctx, store, context = 'dev server') {
   const id = identifyServer(`http://127.0.0.1:${ctx.port}/`);
@@ -501,25 +523,6 @@ function gqlData(ctx, query, timeout = 60000, attempts = 3) {
   const data = j && (j.data || (j.result && j.result.data) || (!errors && typeof j === 'object' ? j : null));
   return { ok: !!data && r.code === 0, data, errors, raw: tail(stripAnsi(r.stdout + r.stderr), 8) };
 }
-function fetchHandles(ctx, limit = 5) {
-  const res = { products: [], collections: [], pages: [], blogs: [], warnings: [] };
-  const p = gqlData(ctx, `{ products(first: ${limit}, query: "status:active", sortKey: UPDATED_AT, reverse: true) { nodes { handle title onlineStoreUrl variants(first: 3) { nodes { id title availableForSale } } } } collections(first: ${limit}, sortKey: UPDATED_AT, reverse: true) { nodes { handle title productsCount { count } } } }`);
-  if (p.ok) {
-    res.products = p.data.products.nodes.map((n) => ({ handle: n.handle, title: n.title, url: n.onlineStoreUrl, variants: n.variants.nodes.map((v) => ({ id: v.id.split('/').pop(), title: v.title, available: v.availableForSale })) }));
-    res.collections = p.data.collections.nodes.map((n) => ({ handle: n.handle, title: n.title, products: n.productsCount && n.productsCount.count }));
-  } else res.warnings.push(`products/collections query failed: ${JSON.stringify(p.errors || p.raw)}`);
-  const c = gqlData(ctx, `{ pages(first: ${limit}) { nodes { handle title templateSuffix } } blogs(first: ${limit}) { nodes { handle title } } }`);
-  if (c.ok) { res.pages = c.data.pages.nodes; res.blogs = c.data.blogs.nodes; }
-  else res.warnings.push(`pages/blogs query failed (needs read_content): ${JSON.stringify(c.errors || c.raw)}`);
-  return res;
-}
-function cmdHandles(ctx, rest) {
-  const { flags } = parseArgs(rest);
-  requireStore(ctx);
-  const h = fetchHandles(ctx, Number(flags.limit || 5));
-  out({ ok: h.warnings.length === 0, ...h });
-}
-
 // ---------------------------------------------------------------- commands: browser
 function baseFor(ctx, target) {
   if (target === 'dev') return `http://127.0.0.1:${ctx.port}`;
@@ -527,10 +530,14 @@ function baseFor(ctx, target) {
   if (target === 'preview') return `https://${ctx.store}`;
   fail(`Unknown target: ${target}`, '--target dev | preview | live');
 }
-function resolveUrl(ctx, target, pathOrUrl) {
+function resolveUrl(ctx, target, pathOrUrl, country = ctx.country) {
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
   const p = pathOrUrl.startsWith('/') ? pathOrUrl : '/' + pathOrUrl;
   const u = new URL(p, baseFor(ctx, target));
+  // The dev proxy geolocates from the machine's IP, so it can render a different market than
+  // live (ES/EUR vs US/USD). `product.available` is market-dependent, so anything gated on it
+  // silently vanishes and dev/live disagree on byte-identical code. Pin it.
+  if (country && !u.searchParams.has('country')) u.searchParams.set('country', String(country).toUpperCase());
   if (target === 'preview') {
     if (!ctx.themeId) fail('preview target needs a theme id.', 'Start the dev server (`dev start`) so the development theme id is known, or pass --theme <id>.');
     u.searchParams.set('preview_theme_id', String(ctx.themeId));
@@ -617,24 +624,6 @@ function cmdScreenshot(ctx, rest) {
   const r = ab(ctx, args);
   if (r.code !== 0 || !fs.existsSync(file)) fail('screenshot failed', 'Is a page open? Run `open <path>` first.', { stderr: tail(stripAnsi(r.stderr + r.stdout), 6) });
   out({ ok: true, file, url: abText(ctx, ['get', 'url']), title: abText(ctx, ['get', 'title']) });
-}
-function cmdRecord(ctx, rest) {
-  const { pos } = parseArgs(rest);
-  const sub = pos[0];
-  if (sub === 'start') {
-    const file = pos[1] ? path.resolve(pos[1]) : evidencePath(ctx, 'recording', 'webm');
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const r = ab(ctx, ['record', 'start', file, ...(pos[2] ? [pos[2]] : [])]);
-    if (r.code !== 0) fail('record start failed', 'Open a page first.', { stderr: tail(stripAnsi(r.stderr + r.stdout), 6) });
-    writeJSON(path.join(ctx.stateDir, 'recording.json'), { file, startedAt: new Date().toISOString() });
-    out({ ok: true, recording: file }); return;
-  }
-  if (sub === 'stop') {
-    const r = ab(ctx, ['record', 'stop']);
-    const st = readJSON(path.join(ctx.stateDir, 'recording.json'), {});
-    out({ ok: r.code === 0, file: st.file, output: stripAnsi(r.stdout).trim() }); return;
-  }
-  fail('record start [file.webm] [url] | record stop');
 }
 function consoleLines(ctx, { clear = false } = {}) {
   const raw = abText(ctx, ['console', ...(clear ? ['--clear'] : [])]).split('\n').map((l) => l.trim()).filter(Boolean);
@@ -800,19 +789,46 @@ function cmdAssert(ctx, rest) {
   if (failed.length) process.exit(1);
 }
 // The whole loop in one command: open -> settle -> assert -> check-page -> evidence.
+function specsDir(ctx) { return path.join(ctx.root, '.claude', 'verify-shopify', 'specs'); }
+function cmdVerifyAll(ctx, rest) {
+  const dir = specsDir(ctx);
+  if (!fs.existsSync(dir)) fail(`No specs directory: ${dir}`, 'Write a spec first — see SKILL.md "The loop".');
+  const names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, '')).sort();
+  if (!names.length) fail(`No specs in ${dir}.`, 'Write a spec first — see SKILL.md "The loop".');
+  const self = process.argv[1];
+  const results = [];
+  for (const name of names) {
+    const args = [self, 'verify', name, ...rest.filter((a) => a !== '--all')];
+    const r = run(process.execPath, args, { timeout: 300000, cwd: ctx.root });
+    let parsed = null; try { parsed = JSON.parse(r.stdout.slice(r.stdout.indexOf('{'))); } catch {}
+    results.push(parsed
+      ? { spec: name, ok: parsed.ok, route: parsed.route, target: parsed.target, passed: parsed.passed, failed: parsed.failed,
+          failures: (parsed.checks || []).filter((c) => !c.ok).map((c) => ({ name: c.name, why: c.why })),
+          problems: parsed.problems, screenshot: parsed.screenshot && parsed.screenshot.file }
+      : { spec: name, ok: false, error: tail(stripAnsi(r.stderr || r.stdout), 6) });
+  }
+  const failed = results.filter((r) => !r.ok);
+  out({ ok: failed.length === 0, specs: results.length,
+    passed: results.length - failed.length, failed: failed.length,
+    totalChecks: results.reduce((a, r) => a + (r.passed || 0) + (r.failed || 0), 0),
+    results });
+  if (failed.length) process.exit(1);
+}
 function cmdVerify(ctx, rest) {
   const { flags, pos } = parseArgs(rest);
+  if (flags.all) return cmdVerifyAll(ctx, rest);
   const store = requireStore(ctx);
   let spec = { checks: [] }; let specFile = null;
   const src = flags.spec || pos[0];
   if (src) { const l = loadSpec(ctx, src); specFile = l.file; spec = l.spec; }
   const route = flags.route || spec.route || '/';
   const target = flags.target || spec.target || ctx.target;
+  const country = flags.country || spec.country || ctx.country;
   if (target === 'dev') {
     if (!portListening(ctx.port)) fail(`Nothing is listening on 127.0.0.1:${ctx.port}.`, 'Run `dev start` first (or --target preview|live).');
     assertOwnServer(ctx, store);
   }
-  const url = resolveUrl(ctx, target, route);
+  const url = resolveUrl(ctx, target, route, country);
   const opened = openWithRetry(ctx, url, { retries: Number(flags.retries || 3) });
   if (!opened.ok) fail(`Could not open ${url}.`, 'Check `dev logs`; the dev proxy 502s intermittently — or use --target preview.', { attempts: opened.attempts });
   const waitFn = flags['wait-fn'] || spec.waitFn;
@@ -835,7 +851,7 @@ function cmdVerify(ctx, rest) {
   if (flags.screenshot) {
     const shotTarget = flags['screenshot-target'] || (target === 'dev' ? 'preview' : target);
     if (shotTarget !== target) {
-      const o2 = openWithRetry(ctx, resolveUrl(ctx, shotTarget, route), { retries: 2, quiet: true });
+      const o2 = openWithRetry(ctx, resolveUrl(ctx, shotTarget, route, country), { retries: 2, quiet: true });
       if (o2.ok && waitFn) ab(ctx, ['wait', '--fn', String(waitFn)]);
       if (o2.ok && settle) ab(ctx, ['wait', String(settle)]);
     }
@@ -846,94 +862,21 @@ function cmdVerify(ctx, rest) {
       : { file: null, target: shotTarget, error: tail(stripAnsi(sr.stderr + sr.stdout), 4) };
   }
   const ok = failedChecks.length === 0 && problems.length === 0;
-  out({ ok, route, target, url: opened.url, title: opened.title, specFile,
+  out({ ok, route, target, country: country || null, url: opened.url, title: opened.title, specFile,
     theme: facts.theme, template: facts.template, waited,
     passed: results.length - failedChecks.length, failed: failedChecks.length, checks: results,
     problems, pageErrors: logs.pageErrors, consoleErrors: logs.consoleErrors, brokenImages: facts.brokenImages, screenshot });
   if (!ok) process.exit(1);
 }
 
-// ---------------------------------------------------------------- commands: cart
-function cmdCart(ctx, rest) {
-  const { pos } = parseArgs(rest);
-  const sub = pos[0];
-  const fetchJson = (route, init) => abEval(ctx, `(async () => { const r = await fetch('${route}', ${init}); let body; try { body = await r.json(); } catch { body = await r.text(); } return JSON.stringify({ status: r.status, body }); })()`);
-  const done = (r) => { let v = r.value; if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} } out({ ok: r.ok && v && v.status < 400, ...(typeof v === 'object' ? v : { raw: v }) }); if (!(r.ok && v && v.status < 400)) process.exit(1); };
-  if (sub === 'add') {
-    const id = String(pos[1] || '').split('/').pop(); const qty = Number(pos[2] || 1);
-    if (!id) fail('cart add <variantId|gid> [qty]', 'Get variant ids from `handles`.');
-    return done(fetchJson('/cart/add.js', `{ method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ items: [{ id: ${Number(id)}, quantity: ${qty} }] }) }`));
-  }
-  if (sub === 'get') return done(fetchJson('/cart.js', `{ headers: { Accept: 'application/json' } }`));
-  if (sub === 'clear') return done(fetchJson('/cart/clear.js', `{ method: 'POST', headers: { Accept: 'application/json' } }`));
-  if (sub === 'open') {
-    const r = ab(ctx, ['find', 'role', 'button', 'click', '--name', 'Cart']);
-    if (r.code !== 0) fail('Could not click a button named "Cart".', 'Check the Feature Map for the cart trigger, or `open /cart`.', { stderr: tail(stripAnsi(r.stderr + r.stdout), 5) });
-    ab(ctx, ['wait', '500']);
-    out({ ok: true, note: 'Clicked the Cart button; run `snapshot` to see the drawer.' }); return;
-  }
-  fail('cart add <variantId> [qty] | cart get | cart clear | cart open');
-}
-
-// ---------------------------------------------------------------- commands: smoke
-function cmdSmoke(ctx, rest) {
-  const { flags } = parseArgs(rest);
-  const target = flags.target || ctx.target;
-  if (target !== 'dev') requireStore(ctx);
-  if (target === 'dev' && !portListening(ctx.port)) fail(`Nothing is listening on 127.0.0.1:${ctx.port}.`, 'Run `dev start` first.');
-  let routes = flags.routes ? String(flags.routes).split(',').map((s) => s.trim()).filter(Boolean) : ctx.routes;
-  const notes = [];
-  if (routes.some((r) => /\{(product|collection|page|blog)\}/.test(r))) {
-    const h = ctx.store ? fetchHandles(ctx, 3) : { products: [], collections: [], pages: [], blogs: [], warnings: ['no store'] };
-    const pick = { product: h.products[0] && h.products[0].handle, collection: h.collections[0] && h.collections[0].handle, page: h.pages[0] && h.pages[0].handle, blog: h.blogs[0] && h.blogs[0].handle };
-    const resolved = [];
-    for (const r of routes) {
-      const m = r.match(/\{(product|collection|page|blog)\}/);
-      if (!m) { resolved.push(r); continue; }
-      if (pick[m[1]]) resolved.push(r.replace(/\{(product|collection|page|blog)\}/g, (_, k) => pick[k]));
-      else notes.push(`skipped ${r}: no ${m[1]} handle available (auth/network?)`);
-    }
-    routes = resolved;
-    if (h.warnings.length) notes.push(...h.warnings);
-  }
-  const runDir = path.join(ctx.evidenceDir, `smoke-${ts()}`);
-  fs.mkdirSync(runDir, { recursive: true });
-  const results = [];
-  routes.forEach((route, i) => {
-    const url = resolveUrl(ctx, target, route);
-    ab(ctx, ['console', '--clear']); ab(ctx, ['errors', '--clear']);
-    const o = openWithRetry(ctx, url, { retries: 2, quiet: true });
-    const facts = o.ok ? pageFacts(ctx) : {};
-    const logs = o.ok ? consoleLines(ctx) : { console: [], consoleErrors: [], pageErrors: [] };
-    let screenshot = null;
-    if (o.ok && !flags['no-screenshots']) {
-      screenshot = path.join(runDir, `${String(i + 1).padStart(2, '0')}-${slug(route)}.png`);
-      ab(ctx, ['screenshot', screenshot]);
-      if (!fs.existsSync(screenshot)) screenshot = null;
-    }
-    const problems = [];
-    if (!o.ok) problems.push('could not open (storefront error / timeout)');
-    if (facts.storefrontError) problems.push('storefront 502 page');
-    if (o.ok && facts.textLength !== undefined && facts.textLength < 20) problems.push('page has (almost) no text');
-    if (logs.pageErrors.length) problems.push(`${logs.pageErrors.length} uncaught page error(s)`);
-    if (ctx.strict && logs.consoleErrors.length) problems.push(`${logs.consoleErrors.length} console error(s)`);
-    const warnings = [];
-    if (facts.brokenImages && facts.brokenImages.length) warnings.push(`${facts.brokenImages.length} broken image(s)${target === 'dev' ? ' (known: local proxy; confirm on --target preview)' : ''}`);
-    if (!ctx.strict && logs.consoleErrors.length) warnings.push(`${logs.consoleErrors.length} console error(s)`);
-    results.push({ route, url: o.url || url, title: o.title || facts.title, status: problems.length ? 'fail' : 'pass', problems, warnings, screenshot,
-      template: facts.template, theme: facts.theme, brokenImages: facts.brokenImages, pageErrors: logs.pageErrors, consoleErrors: logs.consoleErrors, attempts: o.attempts && o.attempts.length });
-  });
-  const failed = results.filter((r) => r.status === 'fail');
-  const summary = { ok: failed.length === 0, target, store: ctx.store, routes: results.length, passed: results.length - failed.length, failed: failed.length, evidenceDir: runDir, notes, results };
-  writeJSON(path.join(runDir, 'report.json'), summary);
-  const md = [`# Smoke report — ${ctx.store || 'store'} (${target})`, '', `Generated ${new Date().toISOString()}`, '', '| # | Route | Status | Problems | Warnings | Screenshot |', '|---|---|---|---|---|---|',
-    ...results.map((r, i) => `| ${i + 1} | \`${r.route}\` | ${r.status} | ${r.problems.join('; ') || '-'} | ${r.warnings.join('; ') || '-'} | ${r.screenshot ? path.basename(r.screenshot) : '-'} |`), ''];
-  fs.writeFileSync(path.join(runDir, 'report.md'), md.join('\n'));
-  out(summary);
-  if (failed.length) process.exit(1);
-}
-
 // ---------------------------------------------------------------- commands: theme tooling
+function changedFiles(ctx) {
+  const tracked = run('git', ['-C', ctx.root, 'diff', '--name-only', 'HEAD'], { timeout: 15000 });
+  const untracked = run('git', ['-C', ctx.root, 'ls-files', '--others', '--exclude-standard'], { timeout: 15000 });
+  if (tracked.code !== 0 && untracked.code !== 0) return null;
+  const names = [...tracked.stdout.split('\n'), ...untracked.stdout.split('\n')].map((l) => l.trim()).filter(Boolean);
+  return [...new Set(names)];
+}
 function cmdCheck(ctx, rest) {
   const { flags } = parseArgs(rest);
   const args = ['theme', 'check', '-o', 'json'];
@@ -945,115 +888,24 @@ function cmdCheck(ctx, rest) {
   let parsed = null; try { parsed = JSON.parse(text.slice(start)); } catch {}
   if (parsed) {
     const files = Array.isArray(parsed) ? parsed : [];
-    const offenses = files.flatMap((f) => (f.offenses || []).map((o) => ({ file: f.path, severity: o.severity, check: o.check, message: o.message, line: o.start_row !== undefined ? o.start_row + 1 : undefined })));
-    const counts = offenses.reduce((a, o) => { a[o.severity] = (a[o.severity] || 0) + 1; return a; }, {});
-    out({ ok: r.code === 0, exitCode: r.code, counts, offenses: flags.all ? offenses : offenses.slice(0, 50), truncated: !flags.all && offenses.length > 50 });
+    const all = files.flatMap((f) => (f.offenses || []).map((o) => ({ file: f.path, severity: o.severity, check: o.check, message: o.message, line: o.start_row !== undefined ? o.start_row + 1 : undefined })));
+    const counts = all.reduce((a, o) => { a[o.severity] = (a[o.severity] || 0) + 1; return a; }, {});
+    // A mature theme carries thousands of pre-existing offenses in vendor/legacy files; reporting
+    // them all buries the handful you just introduced. Default to the files you actually touched.
+    const changed = flags.all ? null : changedFiles(ctx);
+    const offenses = changed ? all.filter((o) => changed.some((c) => o.file && o.file.endsWith(c))) : all;
+    const scopedCounts = offenses.reduce((a, o) => { a[o.severity] = (a[o.severity] || 0) + 1; return a; }, {});
+    out({ ok: offenses.every((o) => o.severity !== 'error'), exitCode: r.code,
+      scope: changed ? 'changed files (git); pass --all for the whole theme' : 'whole theme',
+      changedFiles: changed || undefined, themeWideCounts: counts, counts: scopedCounts,
+      offenses: offenses.slice(0, 100), truncated: offenses.length > 100 });
+    if (offenses.some((o) => o.severity === 'error')) process.exit(1);
+    return;
   } else {
     process.stdout.write(text + '\n' + stripAnsi(r.stderr));
   }
   if (r.code !== 0) process.exit(r.code);
 }
-function cmdProfile(ctx, rest) {
-  const { flags, pos } = parseArgs(rest);
-  if (flags.from) {
-    // Summarize an existing profile JSON (no network): `profile --from .shopify/verify/evidence/<ts>-profile.json`
-    const file = path.resolve(String(flags.from));
-    const parsed = readJSON(file, null);
-    if (!parsed) fail(`Cannot read profile JSON: ${file}`);
-    out({ ok: true, from: file, summary: summarizeProfile(parsed) });
-    return;
-  }
-  requireStore(ctx);
-  const args = ['theme', 'profile', '-s', ctx.store, '--url', pos[0] || '/', '--json'];
-  const themeId = flags.theme || ctx.themeId;
-  if (themeId) args.push('-t', String(themeId));
-  if (ctx.dryRun) { out({ ok: true, dryRun: true, command: `shopify ${args.join(' ')}` }); return; }
-  const r = shopify(args, { cwd: ctx.root, timeout: 300000 });
-  const text = stripAnsi(r.stdout).trim();
-  let parsed = null; try { parsed = JSON.parse(text.slice(Math.max(0, text.indexOf('{')))); } catch {}
-  if (parsed) {
-    const file = evidencePath(ctx, `profile-${pos[0] || 'home'}`, 'json');
-    writeJSON(file, parsed);
-    const nodes = parsed.nodes || parsed.profile || null;
-    out({ ok: r.code === 0, url: pos[0] || '/', themeId, saved: file, summary: summarizeProfile(parsed), note: 'Full Speedscope-format profile saved; open it at https://www.speedscope.app or inspect the JSON.' });
-  } else { process.stdout.write(text + '\n' + stripAnsi(r.stderr)); }
-  if (r.code !== 0) process.exit(r.code);
-}
-function summarizeProfile(p) {
-  // Speedscope "evented" format as emitted by `shopify theme profile --json`:
-  // { shared: { frames: [{name}] }, profiles: [{ type: 'evented', unit: 'nanoseconds', startValue, endValue, events: [{type:'O'|'C', frame, at}] }] }
-  try {
-    const prof = p.profiles && p.profiles[0];
-    const frames = (p.shared && p.shared.frames) || p.frames;
-    if (!prof || !frames || prof.type !== 'evented') return null;
-    const div = { nanoseconds: 1e6, microseconds: 1e3, milliseconds: 1, seconds: 1e-3 }[prof.unit] || 1e6;
-    const incl = new Map(); const self = new Map(); const calls = new Map();
-    const stack = [];
-    for (const ev of prof.events) {
-      if (ev.type === 'O') stack.push({ frame: ev.frame, at: ev.at, child: 0 });
-      else if (ev.type === 'C') {
-        const o = stack.pop(); if (!o) continue;
-        const dur = ev.at - o.at;
-        const name = (frames[o.frame] && frames[o.frame].name) || String(o.frame);
-        incl.set(name, (incl.get(name) || 0) + dur);
-        self.set(name, (self.get(name) || 0) + (dur - o.child));
-        calls.set(name, (calls.get(name) || 0) + 1);
-        if (stack.length) stack[stack.length - 1].child += dur;
-      }
-    }
-    const ms = (v) => Math.round((v / div) * 100) / 100;
-    const top = [...self.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
-      .map(([name, s]) => ({ frame: name, selfMs: ms(s), inclusiveMs: ms(incl.get(name)), calls: calls.get(name) }));
-    return { totalMs: ms(prof.endValue - prof.startValue), frames: frames.length, events: prof.events.length, topBySelfTime: top };
-  } catch { return null; }
-}
-
-// ---------------------------------------------------------------- commands: feature map skeleton
-function cmdMap(ctx, rest) {
-  const { flags } = parseArgs(rest);
-  const root = ctx.root;
-  const rd = (p) => fs.readFileSync(path.join(root, p), 'utf8');
-  const ls = (dir, ext) => (fs.existsSync(path.join(root, dir)) ? fs.readdirSync(path.join(root, dir)).filter((f) => f.endsWith(ext)).sort() : []);
-  const templates = ls('templates', '.json').map((f) => {
-    const j = readJSON(path.join(root, 'templates', f), {}) || {};
-    const order = j.order || Object.keys(j.sections || {});
-    return { file: `templates/${f}`, name: f.replace(/\.json$/, ''), layout: j.layout, sections: order.map((k) => (j.sections && j.sections[k] ? j.sections[k].type : k)) };
-  });
-  const liquidTemplates = ls('templates', '.liquid').map((f) => ({ file: `templates/${f}`, name: f.replace(/\.liquid$/, '') }));
-  const groups = ls('sections', '.json').map((f) => { const j = readJSON(path.join(root, 'sections', f), {}) || {}; const order = j.order || Object.keys(j.sections || {}); return { file: `sections/${f}`, sections: order.map((k) => (j.sections && j.sections[k] ? j.sections[k].type : k)) }; });
-  const sections = ls('sections', '.liquid').map((f) => f.replace(/\.liquid$/, ''));
-  const blocks = ls('blocks', '.liquid').map((f) => f.replace(/\.liquid$/, ''));
-  const snippets = ls('snippets', '.liquid').length;
-  const elements = [];
-  for (const f of ls('assets', '.js')) {
-    const src = rd(`assets/${f}`);
-    for (const m of src.matchAll(/customElements\.define\(\s*['"]([a-z0-9-]+)['"]/g)) elements.push({ element: m[1], file: `assets/${f}` });
-  }
-  const routes = [
-    { route: '/', template: 'index' }, { route: '/collections', template: 'list-collections' }, { route: '/collections/all', template: 'collection' },
-    { route: '/collections/<handle>', template: 'collection' }, { route: '/products/<handle>', template: 'product' }, { route: '/cart', template: 'cart' },
-    { route: '/search?q=<term>', template: 'search' }, { route: '/blogs/<blog>', template: 'blog' }, { route: '/blogs/<blog>/<article>', template: 'article' },
-    { route: '/pages/<handle>', template: 'page' }, { route: '/password', template: 'password' }, { route: '/<anything-missing>', template: '404' },
-    ...templates.filter((t) => /^page\./.test(t.name)).map((t) => ({ route: `/pages/<page with template "${t.name.slice(5)}">`, template: t.name })),
-  ];
-  const md = [
-    `# Feature Map (generated skeleton) — ${ctx.store || path.basename(root)}`, '',
-    `Generated ${new Date().toISOString()} by \`control-shopify map\`. Regenerate any time; hand-written notes belong in README.md and per-feature files next to this one.`, '',
-    '## Routes', '', '| Route | Template |', '|---|---|', ...routes.map((r) => `| \`${r.route}\` | ${r.template} |`), '',
-    '## Templates (section order)', '', ...templates.map((t) => `- **${t.name}** (\`${t.file}\`${t.layout === false ? ', no layout' : ''}): ${t.sections.join(' → ') || '(no sections)'}`),
-    ...liquidTemplates.map((t) => `- **${t.name}** (\`${t.file}\`, Liquid template)`), '',
-    '## Section groups', '', ...groups.map((g) => `- \`${g.file}\`: ${g.sections.join(' → ')}`), '',
-    `## Sections (${sections.length})`, '', sections.map((s) => `\`${s}\``).join(', '), '',
-    `## Blocks (${blocks.length})`, '', blocks.map((s) => `\`${s}\``).join(', '), '',
-    `## Custom elements registered in assets/ (${elements.length})`, '', '| Element | File |', '|---|---|', ...elements.map((e) => `| \`<${e.element}>\` | \`${e.file}\` |`), '',
-    `Snippets: ${snippets}.`, '',
-  ].join('\n');
-  const outFile = path.join(root, flags.out || '.claude/verify-shopify/features/README.generated.md');
-  fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  fs.writeFileSync(outFile, md);
-  out({ ok: true, file: outFile, templates: templates.length + liquidTemplates.length, sections: sections.length, blocks: blocks.length, customElements: elements.length, routes: routes.length });
-}
-
 // ---------------------------------------------------------------- cleanup
 function cmdCleanup(ctx) {
   const closed = ab(ctx, ['close']);
@@ -1070,61 +922,46 @@ function cmdCleanup(ctx) {
 function help() {
   process.stdout.write(`control-shopify v${VERSION} — verification CLI for Shopify theme work
 
-Usage: node ${path.join(SKILL_DIR, 'control-shopify.mjs')} <command> [args] [--store X] [--port N] [--target dev|preview|live] [--session S] [--dry-run] [--headed] [--strict]
+Usage: control-shopify <command> [args]
+Globals: --store X --port N --target dev|preview|live --country US --session S --theme ID
+         --dry-run --headed --strict --json --timeout MS
 
 Setup & health
   init --store <shop>.myshopify.com [--port 9292] [--primary-domain https://…] [--gitignore] [--force]
-                              Write .claude/verify-shopify.json + features/ skeleton in this repo
-  doctor                      Check node, shopify CLI, agent-browser, config, dev server, store token + scopes
-  auth [--scopes a,b] [--dry-run]
-                              shopify store auth with the configured scope list (interactive; opens browser)
-  urls                        Print dev / preview / live / editor URLs for the current store
+  doctor                      node, shopify CLI (+ shadowing installs), agent-browser, config,
+                              dev server identity, theme session, store token + scopes
+  auth [--scopes a,b] [--dry-run]     shopify store auth (interactive; re-auth REPLACES scopes)
+  urls                        dev / preview / live / editor URLs
 
-Dev server (shopify theme dev)
-  dev start [--theme ID] [--live-reload hot-reload|full-page|off] [--wait SECONDS] [--theme-editor-sync]
-  dev status | dev stop | dev restart | dev logs [--tail N]
+Dev server
+  dev start [--theme ID] [--wait SECONDS] | dev status | stop | restart | logs [--tail N]
 
-Verify (write the expectations once, assert them in one round trip)
-  verify <spec> [--route /p] [--target …] [--screenshot [--screenshot-target preview] [--full]]
+Verify — the loop
+  verify <spec> [--route /p] [--target …] [--country US] [--screenshot [--full]]
          [--wait-fn "<js>"] [--settle MS] [--retries 3]
-                              open -> wait -> assert -> check-page -> screenshot; exit 1 if anything fails
-  assert <spec|'[{…}]'|--stdin>
-                              Run the checks against the page that is already open
-                              Spec: .claude/verify-shopify/specs/<name>.json
-                              { "route", "waitFn", "settleMs", "checks": [ … ] }
-                              Check keys: exists | count | minCount | visible | textContains |
-                              textNotContains | textEquals | attr + equals/contains | css |
-                              centeredIn + tolerance | animating
+                              open -> wait -> assert -> check-page -> screenshot; exit 1 on any failure
+  verify --all [--target …]   Run every spec in .claude/verify-shopify/specs/ as a regression suite
+  assert <spec|'[{…}]'|--stdin>       Check the page that is already open
 
-Browser (real Chromium via agent-browser, one isolated session per store)
-  open <path|url> [--target dev|preview|live] [--retries 3]
-                              Navigate; retries the Shopify dev proxy's intermittent 502 page
-  snapshot [-i -c -s <css>]   Accessibility tree with @eN refs (default: -i -c)
-  click|fill|type|press|hover|select|check|scroll|wait|eval|get|find|is|tab|back|reload …
-                              Forwarded to agent-browser verbatim (see: agent-browser --help)
-  screenshot [file] [--full] [--annotate]
-                              PNG into .shopify/verify/evidence/ (prints the path)
-  record start [file.webm] [url] | record stop
-  console | errors [--clear]  Page console / uncaught errors (forwarded)
-  check-page                  One-shot health of the current page: 502?, text, broken images, errors
-  cart add <variantId> [qty] | cart get | cart clear | cart open
+  Spec: .claude/verify-shopify/specs/<name>.json
+        { "route", "country", "waitFn", "settleMs", "checks": [ … ] }
+        Check keys: exists | count | minCount | visible | textContains | textNotContains |
+                    textEquals | attr + equals/contains | css | centeredIn + tolerance | animating
+
+Browser (real Chromium, one isolated session per store)
+  open <path|url> [--target …] [--retries 3]    Navigate; retries the dev proxy's 502/401 pages
+  eval "<js>"                 Run JS in the page — the fastest way to find out why a check failed
+  snapshot [-i -c -s <css>]   Accessibility tree with @eN refs
+  screenshot [file] [--full]  PNG into .shopify/verify/evidence/ — then Read it; that is the point
+  click|fill|type|press|hover|select|wait|get|find|is|console|errors …   forwarded to agent-browser
+  check-page                  502? empty body? broken images? uncaught errors?
   close                       Close this store's browser session
 
-Verification runs
-  smoke [--routes /,/cart,…] [--target …] [--no-screenshots] [--strict]
-                              Open every configured route, collect errors + screenshots, write report.{json,md}
-  check [--fail-level error] [--all]
-                              shopify theme check (Liquid/JSON lint) as JSON
-  profile [/path] [--theme ID]
-                              shopify theme profile — Liquid render profile, saved to evidence/ (+ self-time summary)
-  profile --from <file.json>  Summarize a saved profile offline (no network)
+Lint
+  check [--all] [--fail-level error]  shopify theme check, scoped to files you changed (--all = theme-wide)
 
-Admin API (shopify store execute)
-  gql '<query>' | gql @file.graphql [--variables '{…}'|@vars.json] [--allow-mutations] [--dry-run] [--version 2025-10]
-  handles [--limit 5]         Real product/collection/page/blog handles + variant ids for this store
-
-Feature Map
-  map [--out path]            Generate .claude/verify-shopify/features/README.generated.md from the theme files
+Admin API
+  gql '<query>' | gql @file.graphql [--variables '{…}'|@vars.json] [--allow-mutations] [--dry-run]
 
 Cleanup
   cleanup [--keep-dev]        Close the browser session and stop the dev server
@@ -1159,18 +996,12 @@ function main() {
     case 'urls': return cmdUrls(ctx);
     case 'dev': return cmdDev(ctx, withGlobals);
     case 'gql': return cmdGql(ctx, withGlobals);
-    case 'handles': return cmdHandles(ctx, withGlobals);
     case 'open': return cmdOpen(ctx, withGlobals);
     case 'screenshot': return cmdScreenshot(ctx, rest);
-    case 'record': return cmdRecord(ctx, rest);
     case 'check-page': return cmdCheckPage(ctx);
     case 'assert': return cmdAssert(ctx, withGlobals);
     case 'verify': return cmdVerify(ctx, withGlobals);
-    case 'cart': return cmdCart(ctx, rest);
-    case 'smoke': return cmdSmoke(ctx, withGlobals);
     case 'check': return cmdCheck(ctx, rest);
-    case 'profile': return cmdProfile(ctx, withGlobals);
-    case 'map': return cmdMap(ctx, rest);
     case 'cleanup': return cmdCleanup(ctx);
     default:
       if (PASSTHROUGH.has(cmd)) {

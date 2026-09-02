@@ -26,20 +26,37 @@ Pin an API version with `--version 2025-10` when a recipe depends on it. Validat
 
 ## Recipes
 
-### Navigation menus
+### Finding fixtures (the main event)
+
+Most verification time goes on "which product actually exercises this branch?". Batch-query candidates by handle rather than guessing:
+
 ```graphql
-{ menus(first: 20) { nodes { id handle title isDefault items { id title type url items { title url } } } } }
-{ menu(handle: "main-menu") { id items { id title url type resourceId } } }
-```
-Update (replace the whole item list; include existing ids to keep them):
-```graphql
-mutation($id: ID!, $items: [MenuItemUpdateInput!]!) {
-  menuUpdate(id: $id, title: "Main menu", handle: "main-menu", items: $items) {
-    menu { id items { title url } } userErrors { field message }
+fragment H on Product {
+  handle title status totalInventory templateSuffix
+  metafield(namespace: "custom", key: "bundle_partners") {
+    references(first: 10) { nodes { ... on Product { handle status totalInventory } } }
   }
 }
+{ p0: productByHandle(handle: "a") { ...H }  p1: productByHandle(handle: "b") { ...H } }
 ```
-Items: `{ "title": "Shop", "type": "COLLECTION", "resourceId": "gid://shopify/Collection/…" }` or `{ "title": "About", "type": "HTTP", "url": "/pages/about" }`. Nested via `"items": [...]` (≤3 levels). Then verify on the storefront: `control-shopify open / && control-shopify snapshot -s "header"`.
+
+Forty aliases per request is fine. Then simulate the Liquid branch over the result to pick the fixture that actually reaches the code you changed.
+
+- **`availableForSale` is Storefront-only.** In Admin queries use `status` + `totalInventory`, or variant `inventoryQuantity` / `inventoryPolicy`.
+- **Metafield filters fail open.** `products(query: "metafields.custom.x:true")` can silently return the entire catalogue. Always run a control query before trusting a filtered count.
+- Products by template: `products(first: 250, query: "template_suffix:amazon status:active")`.
+
+### Proving a theme carries your code
+
+```graphql
+{ theme(id: "gid://shopify/OnlineStoreTheme/<id>") {
+    name role
+    files(filenames: ["snippets/x.liquid","templates/y.json"], first: 10) {
+      nodes { filename checksumMd5 body { ... on OnlineStoreThemeFileBodyText { content } } }
+    } } }
+```
+
+md5 `content` against the local file. Liquid matches byte-for-byte. **JSON templates never will** — Shopify rewrites their formatting — so parse both and compare flattened key paths instead. `themes(first: 5, roles: MAIN)` finds the published theme; the dev theme id is in `.shopify/verify/dev.json`.
 
 ### Products & variants
 ```graphql

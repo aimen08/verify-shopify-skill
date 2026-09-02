@@ -1,179 +1,122 @@
 ---
 name: verify-shopify
-description: Verification loop for Shopify theme work on any store. Starts `shopify theme dev`, drives the storefront in a real Chromium via agent-browser (snapshot refs, clicks, screenshots, video, console), runs theme check + Liquid profiling, and reaches the Admin GraphQL API through `shopify store auth/execute` (products, inventory, publications, files, navigation menus). Use whenever you change a Shopify theme and must prove it works, reproduce a storefront bug, verify store data, or hand over screenshots/video as evidence.
+description: Verification loop for Shopify theme work on any store. Runs `shopify theme dev`, drives the storefront in a real Chromium (agent-browser), asserts the DOM against reusable JSON specs, and reaches the Admin GraphQL API through `shopify store execute`. Use whenever you change a Shopify theme and must prove it works, reproduce a storefront bug, or find real product/page fixtures to test against.
 allowed-tools: Bash(control-shopify:*), Bash(node /Users/mac/.claude/skills/verify-shopify/control-shopify.mjs:*), Bash(agent-browser:*), Bash(shopify:*)
 ---
 
 # verify-shopify
 
-One CLI, `control-shopify`, closes the loop: **edit → dev server → drive the page in a real browser → capture evidence → lint/profile → report**. It is store-agnostic; each repo points it at its store with `.claude/verify-shopify.json`.
+One CLI, `control-shopify`, closes the loop: **edit → dev server → assert the real DOM → look at it → report**. Store-agnostic; each repo points at its store with `.claude/verify-shopify.json`.
+
+Every command prints JSON. Failures print `{"ok":false,"error":…,"hint":…}` and exit 1 — the `hint` tells you what to do instead. `control-shopify help` for the full surface.
+
+## Setup (once per repo)
 
 ```bash
-# `control-shopify` is on PATH (symlinked from ~/.claude/skills/verify-shopify/bin). Fallback: node ~/.claude/skills/verify-shopify/control-shopify.mjs
-control-shopify help
+control-shopify init --store <shop>.myshopify.com --port 9292 --gitignore
+control-shopify doctor        # node, CLI, browser, config, dev server, theme session, token scopes
+control-shopify auth          # ONLY if doctor reports missing scopes — re-auth REPLACES the scope set
 ```
 
-Every structured command prints JSON. Failures print `{"ok":false,"error":…,"hint":…}` on stderr and exit 1 — read the `hint`, it tells you what to do instead.
+Prereqs, once per machine: `npm i -g @shopify/cli agent-browser && agent-browser install`.
 
-## 0. One-time setup per repo
-
-```bash
-control-shopify init --store <shop>.myshopify.com [--port 9292] [--gitignore]   # writes .claude/verify-shopify.json
-control-shopify doctor                                                          # node, shopify CLI, agent-browser, token + scopes, dev server
-control-shopify auth                    # only if doctor reports missing scopes — interactive OAuth in the browser
-control-shopify map                     # generated Feature Map skeleton → .claude/verify-shopify/features/README.generated.md
-```
-
-Prereqs (global, once per machine): `npm i -g @shopify/cli agent-browser && agent-browser install`.
-
-Default admin scopes requested by `auth` (edit `scopes` in the config to change):
-`write_products, read_products, write_inventory, read_inventory, read_locations, write_publications, write_files, write_purchase_options, read_online_store_navigation, write_online_store_navigation, write_content`.
-`*_online_store_navigation` = menus (`menuCreate` / `menuUpdate`). `write_content` = pages/blogs (needed to create the admin page behind `page.<suffix>` templates). Re-auth **replaces** the token's scopes, so always request the full list.
-
-Tokens from `shopify store auth` expire daily. `doctor` proves the token with a live query; if `storeAuth.ok` is false, run `auth`.
-
-## 1. The verification loop
-
-**Fast path — one command per surface.** Write the expectations down once as a *spec*, then let `verify` do open → settle → assert → check-page → evidence in a single call. Prefer this over hand-driving `open`/`eval`/`screenshot`; it is fewer round trips and it cannot silently "pass" on an error page.
+## The loop
 
 ```bash
 control-shopify dev start
-control-shopify verify home --screenshot        # .claude/verify-shopify/specs/home.json
-control-shopify verify sensitive-skin           # ... /specs/sensitive-skin.json
-control-shopify smoke --target preview          # every configured route
+control-shopify verify <spec> --screenshot     # open → wait → assert → check-page → PNG
+control-shopify verify --all                   # every spec, as a regression suite
+control-shopify cleanup --keep-dev
 ```
 
-A spec is JSON (`.claude/verify-shopify/specs/<name>.json`), and it stores the page's gotchas so you don't have to remember them:
+Write the expectations down once as a **spec**, then let `verify` do the whole round trip. Prefer it over hand-driving `open`/`eval`/`screenshot`: fewer round trips, and it cannot silently "pass" on an error page.
+
+A spec is JSON at `.claude/verify-shopify/specs/<name>.json`:
 
 ```jsonc
 {
-  "route": "/",
-  "waitFn": "!document.documentElement.hasAttribute('data-cz-intro')",  // intro overlay; runs before the checks
-  "settleMs": 400,                                                      // optional extra pause
+  "route": "/products/some-handle",
+  "country": "US",          // pin the market — see gotchas, this one is not optional
+  "waitFn": "!document.documentElement.hasAttribute('data-intro')",
+  "settleMs": 400,
   "checks": [
-    { "name": "hero eyebrow is centred", "selector": "…__eyebrow", "centeredIn": "…__campaign_hero", "tolerance": 2 },
-    { "name": "marquee actually moves",  "selector": "…__stats_marquee", "animating": true },
-    { "name": "Reviews eyebrow is gone", "selector": "…__ugc_reviews", "textNotContains": "Reviews" },
-    { "name": "og:image",  "selector": "meta[property=\"og:image\"]", "attr": "content", "contains": "exec-b0cc" },
-    { "name": "5 cards",   "selector": "li.cz-card", "count": 5 }
+    { "name": "3 bundle items", "selector": "#bundle .item", "count": 3 },
+    { "name": "sold-out partner excluded", "selector": "#bundle .item[title^=\"Kit\"]", "count": 0 },
+    { "name": "CTA copy", "selector": ".btn-label", "textContains": "ADD ALL 3" },
+    { "name": "og:image", "selector": "meta[property=\"og:image\"]", "attr": "content", "contains": "hero" }
   ]
 }
 ```
 
-Check vocabulary (all optional, combine freely; every check is try/caught so one bad selector cannot void the batch):
-
 | key | asserts |
 |---|---|
 | `exists` | `true` → at least one match; `false` → none |
-| `count`, `minCount` | exact / minimum number of matches |
-| `visible` | non-zero box, not `display:none`/`visibility:hidden`/`opacity:0` |
+| `count`, `minCount` | exact / minimum matches |
+| `visible` | non-zero box, not `display:none` / `visibility:hidden` / `opacity:0` |
 | `textContains`, `textNotContains`, `textEquals` | text of **all** matches joined (absence checks pass with 0 matches — that is the point) |
 | `attr` + `equals` / `contains` | attribute of the first match |
 | `css: {prop: value}` | computed style of the first match |
-| `centeredIn` + `tolerance` | horizontal centre vs. that container, in px. **Use this for "is it centred"** — a screenshot cannot tell a centred element from a left-aligned one inside a centred box |
-| `animating` | a running animation with non-zero duration, scanning **every** match's subtree; reports the observed durations, so you can tell a CSS fallback from the value the JS set |
+| `centeredIn` + `tolerance` | horizontal centre vs. that container, in px — **use this for "is it centred"**; a screenshot cannot tell a centred element from a left-aligned one inside a centred box |
+| `animating` | a running animation with non-zero duration, scanning every match's subtree |
 
-`verify` exits 1 if any check fails or the page has problems; `assert <spec>` runs just the checks against the page that is already open.
+Specs are the thing that compounds: they stay as regression tests, and `verify --all` re-runs them free after the next change.
 
-**Manual loop** (debugging, or exploring a surface before you write its spec):
+## When a check fails
+
+`eval` is the fastest way to find out why — it beats another screenshot every time:
 
 ```bash
-control-shopify dev start                          # uploads the dev theme, waits for the banner, prints preview/share/editor URLs
-control-shopify open /products/<handle>            # real Chromium, isolated session per store, retries the proxy's 502 page
-control-shopify snapshot                           # a11y tree with @eN refs (default -i -c); re-snapshot after ANY page change
-control-shopify click @e12                         # act on refs; find role/text/label when refs are stale
-control-shopify wait --text "Added"                # wait for a specific signal, never a bare sleep
-control-shopify screenshot                         # PNG → .shopify/verify/evidence/<ts>-<title>.png (path printed)
-control-shopify check-page                         # 502? empty body? broken images? uncaught errors? (exit 1 on problems)
-control-shopify errors && control-shopify console              # uncaught exceptions / console (noise like [HotReload] is filtered in smoke/check-page)
-control-shopify check                              # shopify theme check (Liquid + JSON lint) as JSON
-control-shopify smoke                              # every configured route: open → errors → screenshot → report.{json,md}
-control-shopify cleanup --keep-dev                 # close the browser session (leave the dev server for the next task)
+control-shopify eval "(() => { const e = document.querySelector('.thing');
+  return JSON.stringify({ html: e && e.outerHTML.slice(0,300), text: e && e.innerText,
+    display: e && getComputedStyle(e).display, country: Shopify.country, currency: Shopify.currency.active }); })()"
 ```
 
-Rules:
-- **Never claim "verified" without evidence**: a screenshot path (or `record` video) and the `check-page`/`smoke` JSON. Quote the file paths in your report.
-- **Visual fidelity comes from `--target preview`**, not the local proxy. `127.0.0.1:<port>` sometimes serves broken images and intermittently 502s; the share URL (`https://<store>/…?preview_theme_id=<dev theme id>`) renders the same development theme on the real domain. Use `dev` for fast iteration, `preview` for the screenshots you hand over, `live` only to compare against production.
-- **Re-snapshot after every action**; refs die on any DOM change (drawer open, variant change, navigation).
-- **Wait for the right thing**: `wait @ref`, `wait --text`, `wait --url "**/cart"`, `wait --load networkidle`, `wait --fn "<js>"`. Shopify themes patch the DOM via the Section Rendering API (`?section_id=`) — wait for the visible result, not for the request.
-- **Read the Feature Map first** (`.claude/verify-shopify/features/README.md`) when you need a click path, a selector, or a gotcha. Add what you learn back to it.
-- **Never push to the live theme** as part of verification. The dev theme is disposable; `theme push --unpublished` is the way to share a branch.
+`snapshot -i -c` for an a11y tree with `@eN` refs; re-snapshot after **any** DOM change, refs die instantly.
 
-## 2. Targets
+## Screenshots
 
-| target | base URL | use for |
+Take one per surface after the checks pass — and then **Read the PNG**. The DOM checks are pass/fail; the screenshot is the only thing that tells you the page looks right. A screenshot you never open is wasted work, so either look at it or don't take it.
+
+Hand-over screenshots come from `--target preview` (or `live`), not the local proxy — the dev proxy serves broken images and intermittently 502s.
+
+## Targets
+
+| target | base | use for |
 |---|---|---|
-| `dev` (default) | `http://127.0.0.1:<port>` via `shopify theme dev` | fast iteration, hot reload |
-| `preview` | `https://<store>/<path>?preview_theme_id=<dev theme id>` | pixel-accurate screenshots, video, images/CDN, apps |
-| `live` | primary domain (discovered by `doctor`) | before/after comparison |
+| `dev` (default) | `http://127.0.0.1:<port>` | fast iteration, hot reload |
+| `preview` | `https://<store>/…?preview_theme_id=<dev id>` | pixel-accurate screenshots, real CDN/apps |
+| `live` | primary domain | comparing against production |
 
-`open`, `smoke` and `urls` accept `--target`. Password-protected stores: `export SHOPIFY_STORE_PASSWORD=…` — `dev start` passes it to the CLI and `open` submits `/password` automatically for preview/live.
+## Admin API
 
-## 3. Command reference (grouped)
+`gql` is how you find real fixtures — which product actually has 3 partners in stock, which page uses a template. This is usually the hard part of a verification, and it beats guessing handles:
 
-- **Verification:** `verify <spec> [--route /p] [--target …] [--screenshot [--screenshot-target preview] [--full]] [--wait-fn "<js>"] [--settle ms]`, `assert <spec|inline JSON|--stdin>`
-- **Inspection:** `snapshot [-i -c -s <css> -u]`, `get text|html|attr|url|title|count <sel>`, `is visible|enabled <sel>`, `read`, `check-page`, `screenshot [file] [--full] [--annotate]`, `urls`
-- **Navigation:** `open <path|url> [--target …]`, `back`, `reload`, `tab …`, `scroll <dir> [px]`, `scrollintoview <sel>`
-- **Interaction:** `click|dblclick|hover|focus <sel|@ref>`, `fill|type <sel> <text>`, `press <Key>`, `select <sel> <value>`, `check|uncheck`, `find role|text|label|placeholder|testid <value> <action>`, `eval "<js>"` / `eval --stdin`, `cart add <variantId> [qty] | get | clear | open`
-- **Performance:** `profile [/path]` (Liquid render profile, saved to evidence/), `trace start|stop`, `profiler start|stop`, `wait --load networkidle`
-- **Streaming / logs:** `console [--clear]`, `errors [--clear]`, `network requests [--filter …]`, `network har start|stop`, `record start [file.webm] | stop`
-- **Store / admin:** `gql '<query>' | @file [--variables …] [--allow-mutations] [--dry-run]`, `handles`, `auth`, `check`, `dev …`
-- **Health & cleanup:** `doctor`, `dev status|logs|restart|stop`, `close`, `cleanup [--keep-dev]`
-
-Anything not listed is forwarded to `agent-browser` verbatim inside the store's session (`agent-browser --help` for the full surface). Global flags: `--store`, `--port`, `--target`, `--session`, `--theme <id>`, `--dry-run`, `--headed`, `--strict`, `--json`.
-
-Mutations are refused unless you pass `--allow-mutations`. Use `--dry-run` first to see the exact `shopify store execute` line, and say in your report which mutations you ran. See `references/admin-api.md` for recipes (menus, publications, files, inventory, pages, themes).
-
-## 4. Recipes
-
-**Prove a product-page change**
 ```bash
-control-shopify dev start && control-shopify open "/products/$( control-shopify handles | node -pe 'JSON.parse(require("fs").readFileSync(0)).products[0].handle' )"
-control-shopify snapshot -i -c -s "product-form-component"     # scoped snapshot of the buy form
-control-shopify click @e5 && control-shopify wait --text "Added" ; control-shopify screenshot ; control-shopify check-page
-control-shopify open <same path> --target preview && control-shopify screenshot   # the screenshot you hand over
+control-shopify gql '{ productByHandle(handle: "x") { title status variants(first:5){ nodes { sku inventoryQuantity } } } }'
+control-shopify gql @query.graphql --variables '{"n":5}'
 ```
 
-**Reproduce a bug report** — open the route the user named, `record start`, replay their steps with `find text "…" click`, `record stop`, attach the .webm and the `errors` output.
+Mutations are refused unless you pass `--allow-mutations`; `--dry-run` prints the exact command. Say in your report which mutations you ran. Recipes: `references/admin-api.md`.
 
-**Perf** — `control-shopify profile /` before, apply the fix, `control-shopify profile /` after; compare `summary.totalMs` and `summary.topBySelfTime` (Liquid frames: sections, snippets, filters). Re-summarize a saved run without the network: `control-shopify profile --from .shopify/verify/evidence/<ts>-profile.json`. For the browser side: `trace start` → `open` → `trace stop`.
+## Gotchas
 
-**Verify store data** — `control-shopify gql '{ menu(handle: "main-menu") { items { title url } } }'`; product by handle: `{ productByHandle(handle: "x") { id status variants(first: 5) { nodes { id title inventoryQuantity } } } }`.
+- **Pin the market.** The dev proxy geolocates from the machine's IP and can render a different market than live (ES/EUR vs US/USD). `product.available` is market-dependent, so anything gated on it *silently disappears* — a bundle that renders 3 items on live can render nothing on dev with byte-identical code. Set `country` in the spec or config. Without it, dev and live disagree and the honest-looking conclusion is a regression that does not exist.
+- **`"The operation was aborted"` from a `theme` command is an expired session, not a broken CLI.** It starts a device-code OAuth and dies when nobody completes the browser step — impossible from a non-TTY agent shell. Ask the user to run `! shopify theme list --store <shop>` once. `gql` uses a different token and keeps working, which is the tell. Do **not** downgrade the CLI.
+- **Verify against `live` only after proving live carries your code.** Read the theme's files over the Admin API and md5 them against local. Liquid matches byte-for-byte; **JSON templates never will** (Shopify rewrites their formatting) — diff those semantically.
+- **Match the rendered case.** Text checks read `innerText`, so a `text-transform: uppercase` heading is `"24 MORE HOURS"`, not `"24 More Hours"`.
+- **Absence checks can pass vacuously.** A check that an item is *missing* also passes when the container renders nothing at all, or when a loop `break`s before reaching it. Pair every absence check with a positive one (`count: 3`, "the replacement is present"), and pick a fixture where the branch you care about actually executes.
+- **A `--full` screenshot captures lazy content as blank.** Sections below the fold have real height in the DOM but never painted, so the lower two-thirds of a tall page can come back white and look like a catastrophic layout bug. Before believing it, measure: `eval` the sections' `getBoundingClientRect().height`. To actually photograph them, scroll (`eval "window.scrollTo(0, N)"`), wait, then take a viewport screenshot.
+- **Consent banners and chat widgets sit on top of your evidence.** A cookie dialog covers a corner of every screenshot and swallows clicks in that region. Dismiss or remove it (`eval "document.querySelector('#consent')?.remove()"`) before a hand-over screenshot or a click path.
+- **The port may belong to another store.** `dev start`/`doctor` fetch `/` and compare `Shopify.shop` before adopting a listening server. Give each repo its own `port`; never kill another project's server. Stale theme id → delete `.shopify/verify/dev.json`.
+- **The dev proxy 502s and 401s intermittently.** `open` proves a storefront actually rendered and retries. Persistent failures: `dev logs`, `dev restart`.
+- **`shopify version` is what runs; `npm ls -g` is not.** Multiple installs (npm/bun/homebrew) shadow each other, so a version pin can land on a copy that never executes. `doctor` reports shadowing.
+- Sold-out products render disabled buy buttons — pick an available variant. `--target preview` carries a preview-bar iframe that swallows clicks; `open` removes it, but re-run `eval "document.getElementById('PBarNextFrame')?.remove()"` if you navigate by clicking.
+- Never run `theme push` / `theme publish` from a verification session.
 
-**Cart flow without the UI** — `cart add <variantId> 1` then `cart get` (runs in the page's own session so cookies persist), then `open /cart` and screenshot.
+## Feature Map
 
-## 5. Feature Map
+`.claude/verify-shopify/features/README.md` — materialized memory for a store's theme. Record **only what you had to discover**: selectors, click paths, DOM hooks, and gotchas that cost you time. Not prose descriptions of what a section is; the code already says that.
 
-Location: `.claude/verify-shopify/features/README.md` (index) + one file per surface. It is materialized memory for this store's theme: what each feature is, how a user reaches it, the DOM hooks (custom elements, `data-testid`, `ref=`, form actions), the network signals, and gotchas. Format: `references/feature-map-template.md`.
+Good entries look like: *"no `button[name=add]` on this template, it's `[data-arp-atc]`"*, *"the cap `break` runs before the skip checks, so absence checks pass vacuously"*, *"dev renders ES, live renders US"*.
 
-Building one for a new store:
-1. `control-shopify map` — generated skeleton from the theme files (templates → section order, section groups, custom elements, routes).
-2. Read `README.md`, `layout/theme.liquid`, `snippets/scripts.liquid`, the header/cart/product/collection/search sections and their JS in `assets/`. Note `data-testid`, `ref=`, `on:click="…"` handlers, form actions, `Theme.routes`, and every `customElements.define`.
-3. Write the index + one file per surface following the template. Keep it terse; selectors and click paths, not prose.
-4. `open` each surface once and confirm the click paths with `snapshot`.
-
-## 6. Gotchas (learned on real stores)
-
-- **The port may belong to another store.** `dev start`/`dev status`/`doctor` adopt a server that is already listening — so before using one they now fetch `/` and compare the inlined `Shopify.shop` to the configured store, and refuse on a mismatch (`Port 9292 is serving other-store.myshopify.com, not yours`). This is a real failure mode when you work on several stores: a second project's `shopify theme dev` on 9292 will otherwise be screenshotted and reported as yours, and its theme id gets written into `.shopify/verify/dev.json`, which then breaks the next real `dev start` with *"No themes on the store … match the ID"*. Give each repo its own `port` in `.claude/verify-shopify.json`, and if you hit a stale id just delete `.shopify/verify/dev.json`. Never kill the other project's server to free the port.
-- **The dev proxy 401s as well as 502s.** Alongside the 502 page it intermittently serves a bare *"The access token provided is expired, revoked, malformed…"* body **with an empty `<title>`** (the CLI session token expires daily). `open` now proves a storefront actually rendered — `Shopify.shop` present, or a body longer than a stub — instead of trusting the exit code, and retries otherwise. Without that gate every selector matches 0 elements and a run reports a confident, wrong answer. Persistent 401s: re-run `shopify theme dev` once interactively to refresh the session, or `dev restart`.
-- `shopify theme dev` prints nothing for 60–120 s while it uploads; `dev start` waits up to 240 s (`--wait N`). If the port is already listening it adopts that server — after the store-identity check above.
-- The local proxy returns **"Failed to render storefront with status 502"** intermittently, with a normal page title in agent-browser's own output. `open`/`smoke` detect it via the title and retry with backoff. Persistent 502s: `dev logs`, then `dev restart`.
-- Third-party apps (reviews, rewards, chat) log noisy console lines and inject floating widgets; filter with `consoleNoise` in the config and prefer `errors` (uncaught) over `console` for pass/fail. `--strict` makes console `[error]` lines fail too.
-- Sold-out products render disabled quantity/add buttons — pick a variant with `available: true` from `handles`. `available` comes from the Admin API and ignores markets/publications: the storefront can still say "Unavailable" for the viewer's country while `cart add` succeeds. Read the button text (`get text "button[name=add]"`) when the buy flow itself is under test.
-- `--target preview` pages carry Shopify's preview-bar iframe (`#PBarNextFrame`), which covers the bottom of the viewport and swallows clicks; `open` removes it (`previewBarRemoved` in its output). If you navigate by clicking links instead of `open`, run `eval "document.getElementById('PBarNextFrame')?.remove()"` again.
-- Storefront password pages, store redirects to a custom primary domain, and `preview_theme_id` cookies all persist in the session; `close`/`cleanup` resets everything.
-- agent-browser's default (unnamed) session is shared machine-wide. This tool always uses `verify-<store prefix>`; pass `--session` to run two stores side by side (with different `--port`s).
-- `shopify theme check` needs the theme root as cwd; the CLI runs it from the repo root it found (`.claude/verify-shopify.json` or `.git`).
-- Shopify CLI network calls (`store execute`, `theme profile`, `theme dev` uploads) intermittently time out to Shopify's edge (`connect ETIMEDOUT …:443`) on some networks while the browser is fine. `handles`, `smoke` and `doctor` retry three times; if `profile` or `gql` fails with that error, just re-run it.
-- Never run `theme push` / `theme publish` from a verification session; `dev` uploads to the development theme only.
-
-## 7. Maintain this skill
-
-Run weekly, or whenever a verification step surprised you:
-1. `control-shopify doctor` — fix anything red (token, scopes, missing binaries).
-2. `control-shopify map` and diff `README.generated.md` against the hand-written Feature Map; add new sections/elements, delete removed ones.
-3. `control-shopify smoke --target preview` — every route green; new routes go into `routes` in the config.
-4. Add new gotchas to the Feature Map and to §6 above. Prune `consoleNoise`.
-5. If a command in `control-shopify.mjs` had to be worked around by hand, fix the command — agents should run a CLI command, not write throwaway scripts.
-
-References: `references/browser-tooling.md` (why agent-browser; obscura findings; headless-Chrome fallback), `references/storefront-routes.md` (Shopify URL/AJAX/Section Rendering map), `references/admin-api.md` (scopes + GraphQL recipes), `references/feature-map-template.md`.
+References: `references/storefront-routes.md` (URL/AJAX/Section Rendering map), `references/admin-api.md` (scopes + GraphQL recipes), `references/feature-map-template.md`, `references/browser-tooling.md`.
