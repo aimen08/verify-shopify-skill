@@ -39,9 +39,35 @@ Then in Claude Code, type `/verify-shopify` (or just ask it to verify a theme ch
 
 ## The loop
 
+Write each surface's expectations down once as a **spec**, then verify it in one command:
+
 ```bash
-control-shopify dev start                 # uploads the dev theme, prints preview / share / editor URLs
-control-shopify open /products/<handle>   # retries the dev proxy's intermittent 502 page
+control-shopify dev start
+control-shopify verify home --screenshot   # open → wait → assert → check-page → screenshot, one JSON verdict
+control-shopify smoke --target preview     # every configured route
+```
+
+`.claude/verify-shopify/specs/home.json`:
+
+```json
+{
+  "route": "/",
+  "waitFn": "!document.documentElement.hasAttribute('data-cz-intro')",
+  "checks": [
+    { "name": "hero eyebrow is centred", "selector": ".hero .eyebrow", "centeredIn": ".hero", "tolerance": 2 },
+    { "name": "marquee actually moves",  "selector": ".marquee", "animating": true },
+    { "name": "og:image", "selector": "meta[property=\"og:image\"]", "attr": "content", "contains": "social-card" },
+    { "name": "5 cards", "selector": "li.card", "count": 5 }
+  ]
+}
+```
+
+Checks: `exists`, `count`/`minCount`, `visible`, `textContains`/`textNotContains`/`textEquals`, `attr`+`equals`/`contains`, `css`, `centeredIn`+`tolerance`, `animating`. They all run in a single round trip, each independently try/caught, and `verify` exits 1 if any fails. `centeredIn` and `animating` exist because a screenshot cannot distinguish a centred element from a left-aligned one inside a centred box, nor a moving marquee from a still one.
+
+Lower-level commands, for debugging or exploring a surface before it has a spec:
+
+```bash
+control-shopify open /products/<handle>   # retries the dev proxy's intermittent 502 / 401 pages
 control-shopify snapshot                  # a11y tree with @eN refs
 control-shopify click @e12
 control-shopify wait --text "Added"
@@ -68,7 +94,11 @@ references/
   feature-map-template.md   format for per-store Feature Maps
 ```
 
-Per-repo files (not in this repo): `.claude/verify-shopify.json`, `.claude/verify-shopify/features/*.md`, and state/evidence under `.shopify/verify/` (gitignore `.shopify/`).
+Per-repo files (not in this repo): `.claude/verify-shopify.json`, `.claude/verify-shopify/features/*.md`, `.claude/verify-shopify/specs/*.json`, and state/evidence under `.shopify/verify/` (gitignore `.shopify/`).
+
+## Working on several stores at once
+
+Give every repo its own `port` in `.claude/verify-shopify.json`. `dev start`, `dev status` and `doctor` refuse a server whose inlined `Shopify.shop` is not the configured store, so another project's `shopify theme dev` on the same port fails loudly instead of being screenshotted and reported as yours.
 
 ## Maintain
 

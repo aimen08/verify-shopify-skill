@@ -16,7 +16,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const SKILL_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_PORT = 9292;
@@ -138,7 +138,12 @@ function buildContext(globals) {
   const passwordEnv = config.storePasswordEnv || 'SHOPIFY_STORE_PASSWORD';
   return {
     root, configFile, config, store, port, stateDir, evidenceDir, devState, storeState, session,
-    themeId: globals.theme || (devState && devState.themeId) || config.themeId || null,
+    // Only trust a persisted theme id if it was recorded for THIS store; a dev.json written while
+    // another project's server was adopted would otherwise reach `theme dev --theme`, which fails
+    // with "No themes on the store ... match the ID".
+    themeId: globals.theme
+      || (devState && devState.themeId && (!devState.store || normalizeStore(devState.store) === store) ? devState.themeId : null)
+      || config.themeId || null,
     target: globals.target || config.defaultTarget || 'dev',
     primaryDomain: config.primaryDomain || storeState.primaryDomain || null,
     storePassword: process.env[passwordEnv] || config.storePassword || null,
@@ -243,8 +248,19 @@ function cmdDoctor(ctx) {
   checks.agentBrowser = { ok: !av.missing && av.code === 0, version: stripAnsi(av.stdout).trim(), hint: av.missing ? 'npm i -g agent-browser && agent-browser install' : undefined };
   checks.config = { ok: fs.existsSync(ctx.configFile), file: ctx.configFile, store: ctx.store, hint: fs.existsSync(ctx.configFile) ? undefined : 'control-shopify init --store <shop>.myshopify.com' };
   const listening = portListening(ctx.port);
-  checks.devServer = { ok: listening, port: ctx.port, pid: ctx.devState && ctx.devState.pid, alive: ctx.devState ? isAlive(ctx.devState.pid) : false,
-    previewUrl: listening ? `http://127.0.0.1:${ctx.port}` : null, shareUrl: ctx.devState && ctx.devState.shareUrl, hint: listening ? undefined : 'control-shopify dev start' };
+  // "Something is listening" is not the same as "our store's dev server is listening".
+  // 3 attempts, not 1: the dev proxy 401s intermittently, and a single miss would report a healthy
+  // server as "not a Shopify storefront".
+  const serving = listening ? identifyServer(`http://127.0.0.1:${ctx.port}/`, 3) : null;
+  const servingShop = serving && serving.shop;
+  const ownsPort = !listening ? false : (ctx.store ? (!!servingShop && normalizeStore(servingShop) === ctx.store) : true);
+  checks.devServer = { ok: listening && ownsPort, port: ctx.port, servingShop: servingShop || null,
+    pid: ctx.devState && ctx.devState.pid, alive: ctx.devState ? isAlive(ctx.devState.pid) : false,
+    previewUrl: listening ? `http://127.0.0.1:${ctx.port}` : null, shareUrl: ctx.devState && ctx.devState.shareUrl,
+    hint: !listening ? 'control-shopify dev start'
+      : ownsPort ? undefined
+      : servingShop ? `port ${ctx.port} serves ${servingShop} (another project) — control-shopify dev start --port <free>`
+      : `port ${ctx.port} is busy but did not identify as a Shopify storefront — dev logs, or use a free --port` };
   if (ctx.store) {
     const t = tokenCheck(ctx);
     if (t.ok) {
@@ -294,19 +310,45 @@ function fetchText(url, timeoutMs = 20000) {
       .catch((e) => { process.stdout.write(JSON.stringify({ status: 0, error: String(e) })); });`], { timeout: timeoutMs + 5000 });
   try { return JSON.parse(r.stdout); } catch { return { status: 0, error: 'no response' }; }
 }
-// Every Shopify storefront inlines `Shopify.theme = {...}`; use it to learn which theme a URL renders.
-function discoverTheme(url, attempts = 3) {
+// Every Shopify storefront inlines `Shopify.shop` and `Shopify.theme = {...}`; use them to learn
+// which STORE and which theme a URL actually renders. The shop is the important half: a server
+// listening on our port may belong to a completely different project (see assertOwnServer).
+function identifyServer(url, attempts = 3) {
+  let status = 0;
   for (let i = 0; i < attempts; i++) {
     const res = fetchText(url);
-    const m = res.body && res.body.match(/Shopify\.theme\s*=\s*(\{[^;]*\});/);
-    if (m) { try { return JSON.parse(m[1]); } catch {} }
+    status = res.status || status;
+    const body = res.body || '';
+    const ms = body.match(/Shopify\.shop\s*=\s*["']([^"']+)["']/);
+    const mt = body.match(/Shopify\.theme\s*=\s*(\{[^;]*\});/);
+    let theme = null;
+    if (mt) { try { theme = JSON.parse(mt[1]); } catch {} }
+    if (ms || theme) return { shop: ms ? ms[1] : null, theme, status };
     sleep(1500 * (i + 1));
   }
-  return null;
+  return { shop: null, theme: null, status };
+}
+function discoverTheme(url, attempts = 3) { return identifyServer(url, attempts).theme; }
+// Refuse to use a dev server that is serving somebody else's store. Without this every screenshot,
+// assertion and smoke row silently describes the wrong storefront -- and a foreign theme id gets
+// persisted into .shopify/verify/dev.json, which then breaks the next real `dev start`.
+function assertOwnServer(ctx, store, context = 'dev server') {
+  const id = identifyServer(`http://127.0.0.1:${ctx.port}/`);
+  if (id.shop && normalizeStore(id.shop) === normalizeStore(store)) return id;
+  const relCfg = path.relative(ctx.root, ctx.configFile) || ctx.configFile;
+  if (id.shop) {
+    fail(`Port ${ctx.port} is serving ${id.shop}, not ${store}.`,
+      `Another project's \`shopify theme dev\` owns this port. Run yours on a free port: control-shopify dev start --port <free>  (and set "port" in ${relCfg}).`,
+      { port: ctx.port, servingShop: id.shop, expectedStore: store, context });
+  }
+  fail(`Could not identify the ${context} on port ${ctx.port}.`,
+    'It answered but did not look like a Shopify storefront (502, or still booting). Try `dev logs`, `dev restart`, or a different --port.',
+    { port: ctx.port, expectedStore: store, httpStatus: id.status, context });
 }
 function adoptDevServer(ctx, store) {
-  // A dev server is listening but we did not start it: learn the theme id from the page and persist it.
-  const theme = discoverTheme(`http://127.0.0.1:${ctx.port}/`);
+  // A dev server is listening but we did not start it. Prove it belongs to THIS store before
+  // adopting it, then learn the theme id from the page and persist it.
+  const theme = assertOwnServer(ctx, store, 'adopted dev server').theme;
   const state = { pid: null, adopted: true, port: ctx.port, store, previewUrl: `http://127.0.0.1:${ctx.port}`,
     themeId: theme ? String(theme.id) : null, themeName: theme ? theme.name : null,
     shareUrl: theme ? `https://${store}/?preview_theme_id=${theme.id}` : null,
@@ -330,7 +372,15 @@ function cmdDev(ctx, rest) {
   const status = () => {
     const listening = portListening(ctx.port);
     let state = readJSON(ctx.files.dev, null);
-    if (listening && (!state || !state.themeId)) state = adoptDevServer(ctx, store);
+    // State recorded for a different port or a different store tells us nothing about the process
+    // listening on THIS port -- discard it rather than reporting its theme id against a stranger.
+    if (state && ((state.port && Number(state.port) !== Number(ctx.port))
+      || (state.store && normalizeStore(state.store) !== store))) state = null;
+    // Re-verify identity whenever we cannot prove we own the listener: no state, no theme id, a
+    // previously adopted server, or a recorded pid that has died (the port may have been reused).
+    const livePid = (state && state.pid && isAlive(state.pid)) ? state.pid : (pid && isAlive(pid) ? pid : null);
+    const owned = !!(state && state.themeId && !state.adopted && livePid);
+    if (listening && !owned) state = adoptDevServer(ctx, store);
     return { ok: listening, running: listening, port: ctx.port, pid: (state && state.pid) || pid, pidAlive: pid ? isAlive(pid) : false,
       adopted: !!(state && state.adopted),
       previewUrl: listening ? `http://127.0.0.1:${ctx.port}` : null,
@@ -506,13 +556,29 @@ function openWithRetry(ctx, url, { retries = 3, quiet = false } = {}) {
     const r = ab(ctx, ['open', ...(ctx.headed ? ['--headed'] : []), url]);
     let title = abText(ctx, ['get', 'title']);
     let cur = abText(ctx, ['get', 'url']);
-    const bad = /Failed to render storefront|Bad Gateway|502|503|504/i.test(title);
-    attempts.push({ attempt: i, title, url: cur, exit: r.code, timedOut: r.timedOut });
     if (/\/password(\?|$)/.test(cur) && ctx.storePassword) {
       unlockPassword(ctx); ab(ctx, ['open', url]);
       title = abText(ctx, ['get', 'title']); cur = abText(ctx, ['get', 'url']);
     }
-    if (!bad && (title || r.code === 0)) {
+    // The dev proxy fails in more ways than the documented 502. It also serves a bare 401 body
+    // ("The access token provided is expired, revoked, malformed...") with an EMPTY <title>, and
+    // the old check (`title || exit === 0`) accepted that page -- after which every selector
+    // matches 0 elements and the run reports a confident, wrong answer. Prove a storefront
+    // rendered (Shopify.shop is inlined on every storefront page) before accepting the load.
+    const probe = abEval(ctx, `JSON.stringify({ shop: (window.Shopify && Shopify.shop) || null, len: (document.body && document.body.innerText || '').length, head: (document.body && document.body.innerText || '').slice(0, 160) })`);
+    let p = probe.value;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch { p = null; } }
+    p = p || {};
+    const badTitle = /Failed to render storefront|Bad Gateway|502|503|504/i.test(title);
+    const authError = /access token provided is expired|revoked, malformed/i.test(p.head || '');
+    const notStorefront = !p.shop && Number(p.len || 0) < 400;
+    const bad = badTitle || authError || notStorefront;
+    attempts.push({ attempt: i, title, url: cur, exit: r.code, timedOut: r.timedOut,
+      shop: p.shop || null, bodyTextLength: p.len == null ? null : p.len,
+      reason: !bad ? null : badTitle ? 'storefront error page'
+        : authError ? 'dev proxy 401 (expired CLI token)'
+        : 'page did not render a storefront' });
+    if (!bad) {
       // Shopify injects a preview bar iframe (#PBarNextFrame / #preview-bar-iframe) on preview_theme_id pages;
       // it sits over the bottom of the viewport and swallows clicks. Remove it so refs stay clickable.
       const pb = abEval(ctx, `(() => { const els = document.querySelectorAll('#PBarNextFrame, #preview-bar-iframe, iframe[src*="preview_bar"]'); els.forEach(e => e.remove()); return els.length; })()`);
@@ -600,10 +666,191 @@ function cmdCheckPage(ctx) {
   const problems = [];
   if (facts.storefrontError) problems.push('storefront 502 page');
   if (facts.textLength !== undefined && facts.textLength < 20) problems.push('page has (almost) no text');
+  if (facts.brokenImages && facts.brokenImages.length) problems.push(`${facts.brokenImages.length} broken image(s)`);
   if (logs.pageErrors.length) problems.push(`${logs.pageErrors.length} uncaught page error(s)`);
   if (ctx.strict && logs.consoleErrors.length) problems.push(`${logs.consoleErrors.length} console error(s)`);
   out({ ok: problems.length === 0, problems, ...facts, ...logs });
   if (problems.length) process.exit(1);
+}
+
+// ---------------------------------------------------------------- commands: assert / verify
+// One round trip, many DOM assertions. Every check runs inside a single `eval` in the page and is
+// individually try/caught, so one bad selector cannot void the rest of the batch.
+function buildChecksJs(checks) {
+  return `JSON.stringify((() => {
+  const specs = ${JSON.stringify(checks)};
+  const round = (n) => Math.round(n * 100) / 100;
+  const textOf = (els) => els.map((e) => (e.innerText || e.textContent || '')).join('\\n');
+  return specs.map((s, i) => {
+    const name = s.name || s.selector || ('check ' + (i + 1));
+    const r = { name, selector: s.selector || null, ok: true, matched: 0, detail: {} };
+    const bad = (why, detail) => { r.ok = false; r.why = why; if (detail) Object.assign(r.detail, detail); };
+    try {
+      const els = s.selector ? Array.prototype.slice.call(document.querySelectorAll(s.selector)) : [];
+      r.matched = els.length;
+      if (s.exists === false) { if (els.length) bad('expected no match, found ' + els.length); return r; }
+      if (typeof s.count === 'number' && els.length !== s.count) bad('expected count ' + s.count + ', got ' + els.length);
+      if (typeof s.minCount === 'number' && els.length < s.minCount) bad('expected at least ' + s.minCount + ', got ' + els.length);
+      // Absence checks stay meaningful with zero matches -- run them before the element gate.
+      if (s.textNotContains != null) {
+        const t = textOf(els);
+        if (t.indexOf(s.textNotContains) !== -1) bad('text contains "' + s.textNotContains + '"', { text: t.slice(0, 200) });
+      }
+      const needsEl = s.exists === true || s.textContains != null || s.textEquals != null || s.attr != null
+        || s.css != null || s.centeredIn != null || s.animating != null || s.visible != null;
+      if (needsEl && !els.length) { bad('selector matched 0 elements'); return r; }
+      if (s.textContains != null) {
+        const t = textOf(els);
+        if (t.indexOf(s.textContains) === -1) bad('text does not contain "' + s.textContains + '"', { text: t.slice(0, 200) });
+      }
+      if (s.textEquals != null) { const t = textOf(els).trim(); if (t !== s.textEquals) bad('text is "' + t.slice(0, 120) + '"'); }
+      const el = els[0];
+      if (s.attr != null) {
+        const v = el.getAttribute(s.attr);
+        r.detail[s.attr] = v;
+        if (s.equals != null && v !== s.equals) bad('attr ' + s.attr + ' = "' + v + '"');
+        if (s.contains != null && (v == null || v.indexOf(s.contains) === -1)) bad('attr ' + s.attr + ' does not contain "' + s.contains + '"');
+      }
+      if (s.css) {
+        const cs = getComputedStyle(el);
+        Object.keys(s.css).forEach((p) => {
+          const got = String(cs.getPropertyValue(p)).trim();
+          r.detail[p] = got;
+          if (got !== String(s.css[p])) bad('css ' + p + ' = "' + got + '" (want "' + s.css[p] + '")');
+        });
+      }
+      if (s.visible != null) {
+        const rect = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        const vis = rect.width > 0 && rect.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && Number(cs.opacity) > 0;
+        r.detail.visible = vis;
+        if (vis !== !!s.visible) bad('visible = ' + vis);
+      }
+      // The bug class this exists for: an element that is text-align:center inside a box that is
+      // itself off-centre still "looks centred" in a screenshot. Compare centres, in pixels.
+      if (s.centeredIn != null) {
+        const parent = document.querySelector(s.centeredIn);
+        if (!parent) { bad('centeredIn selector matched nothing: ' + s.centeredIn); return r; }
+        const a = el.getBoundingClientRect(), b = parent.getBoundingClientRect();
+        const delta = round((a.left + a.width / 2) - (b.left + b.width / 2));
+        const tol = s.tolerance == null ? 2 : s.tolerance;
+        r.detail.centerOffsetPx = delta;
+        r.detail.child = { left: round(a.left), width: round(a.width) };
+        r.detail.container = { left: round(b.left), width: round(b.width) };
+        if (Math.abs(delta) > tol) bad('horizontal centre is off by ' + delta + 'px (tolerance ' + tol + 'px)');
+      }
+      // subtree:true because the animated node is usually a child (a marquee track, a slider rail),
+      // and scan EVERY match: a selector like [class*="__stats_marquee"] hits both the section and
+      // its background wrapper, and only one of them carries the animation.
+      if (s.animating != null) {
+        let anims = [];
+        els.forEach((node) => {
+          try {
+            (node.getAnimations ? node.getAnimations({ subtree: true }) : []).forEach((a) => {
+              let dur = null;
+              try { dur = a.effect && a.effect.getTiming ? a.effect.getTiming().duration : null; } catch (e) {}
+              anims.push({ playState: a.playState, durationMs: typeof dur === 'number' ? round(dur) : dur, name: a.animationName || null });
+            });
+          } catch (e) {}
+        });
+        const running = anims.filter((a) => a.playState === 'running' && typeof a.durationMs === 'number' && a.durationMs > 0);
+        r.detail.animations = anims.slice(0, 6);
+        r.detail.runningDurationsMs = running.map((a) => a.durationMs);
+        if (!!s.animating !== (running.length > 0)) bad('animating = ' + (running.length > 0));
+      }
+      return r;
+    } catch (e) { bad('check threw: ' + (e && e.message ? e.message : String(e))); return r; }
+  });
+})())`;
+}
+function loadSpec(ctx, file) {
+  const name = String(file).replace(/^@/, '');
+  const candidates = [
+    path.isAbsolute(name) ? name : path.join(ctx.root, name),
+    path.join(ctx.root, '.claude', 'verify-shopify', 'specs', name),
+    path.join(ctx.root, '.claude', 'verify-shopify', 'specs', name + '.json'),
+  ];
+  const found = candidates.find((c) => fs.existsSync(c));
+  if (!found) fail(`Spec file not found: ${file}`, `Looked in: ${candidates.join(', ')}`);
+  const spec = readJSON(found, null);
+  if (!spec) fail(`Spec file is not valid JSON: ${found}`);
+  return { file: found, spec: Array.isArray(spec) ? { checks: spec } : spec };
+}
+function runChecks(ctx, checks) {
+  const r = abEval(ctx, buildChecksJs(checks));
+  let v = r.value;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} }
+  if (!Array.isArray(v)) fail('Could not run the checks in the page.', 'Is a page open? Run `open <path>` (or use `verify`, which opens for you).', { raw: String(r.raw).slice(0, 400) });
+  return v;
+}
+function cmdAssert(ctx, rest) {
+  const { flags, pos } = parseArgs(rest);
+  let checks = null; let specFile = null;
+  const src = flags.spec || pos[0];
+  if (flags.stdin) { try { checks = JSON.parse(fs.readFileSync(0, 'utf8')); } catch (e) { fail('--stdin did not receive valid JSON', String(e.message)); } }
+  else if (typeof src === 'string' && /^\s*[[{]/.test(src)) { try { checks = JSON.parse(src); } catch (e) { fail('inline spec is not valid JSON', String(e.message)); } }
+  else if (src) { const l = loadSpec(ctx, src); specFile = l.file; checks = l.spec.checks; }
+  if (Array.isArray(checks) === false && checks && Array.isArray(checks.checks)) checks = checks.checks;
+  if (!Array.isArray(checks) || !checks.length) {
+    fail('assert needs checks.', 'assert <spec-name|path> | assert --stdin < spec.json | assert \'[{"selector":"h1","exists":true}]\'');
+  }
+  const results = runChecks(ctx, checks);
+  const failed = results.filter((r) => !r.ok);
+  out({ ok: failed.length === 0, specFile, url: abText(ctx, ['get', 'url']), passed: results.length - failed.length, failed: failed.length, checks: results });
+  if (failed.length) process.exit(1);
+}
+// The whole loop in one command: open -> settle -> assert -> check-page -> evidence.
+function cmdVerify(ctx, rest) {
+  const { flags, pos } = parseArgs(rest);
+  const store = requireStore(ctx);
+  let spec = { checks: [] }; let specFile = null;
+  const src = flags.spec || pos[0];
+  if (src) { const l = loadSpec(ctx, src); specFile = l.file; spec = l.spec; }
+  const route = flags.route || spec.route || '/';
+  const target = flags.target || spec.target || ctx.target;
+  if (target === 'dev') {
+    if (!portListening(ctx.port)) fail(`Nothing is listening on 127.0.0.1:${ctx.port}.`, 'Run `dev start` first (or --target preview|live).');
+    assertOwnServer(ctx, store);
+  }
+  const url = resolveUrl(ctx, target, route);
+  const opened = openWithRetry(ctx, url, { retries: Number(flags.retries || 3) });
+  if (!opened.ok) fail(`Could not open ${url}.`, 'Check `dev logs`; the dev proxy 502s intermittently — or use --target preview.', { attempts: opened.attempts });
+  const waitFn = flags['wait-fn'] || spec.waitFn;
+  let waited = null;
+  if (waitFn) { const w = ab(ctx, ['wait', '--fn', String(waitFn)]); waited = { fn: String(waitFn), ok: w.code === 0 }; }
+  const settle = flags.settle || spec.settleMs;
+  if (settle) ab(ctx, ['wait', String(settle)]);
+  const results = (spec.checks && spec.checks.length) ? runChecks(ctx, spec.checks) : [];
+  const failedChecks = results.filter((r) => !r.ok);
+  const facts = pageFacts(ctx);
+  const logs = consoleLines(ctx);
+  const problems = [];
+  if (facts.storefrontError) problems.push('storefront 502 page');
+  if (facts.textLength !== undefined && facts.textLength < 20) problems.push('page has (almost) no text');
+  if (facts.brokenImages && facts.brokenImages.length) problems.push(`${facts.brokenImages.length} broken image(s)`);
+  if (logs.pageErrors.length) problems.push(`${logs.pageErrors.length} uncaught page error(s)`);
+  if (ctx.strict && logs.consoleErrors.length) problems.push(`${logs.consoleErrors.length} console error(s)`);
+  // Hand-over screenshots come from `preview`, not the local proxy (see SKILL.md "Targets").
+  let screenshot = null;
+  if (flags.screenshot) {
+    const shotTarget = flags['screenshot-target'] || (target === 'dev' ? 'preview' : target);
+    if (shotTarget !== target) {
+      const o2 = openWithRetry(ctx, resolveUrl(ctx, shotTarget, route), { retries: 2, quiet: true });
+      if (o2.ok && waitFn) ab(ctx, ['wait', '--fn', String(waitFn)]);
+      if (o2.ok && settle) ab(ctx, ['wait', String(settle)]);
+    }
+    const file = evidencePath(ctx, 'verify-' + route);
+    const sr = ab(ctx, ['screenshot', ...(flags.full ? ['--full'] : []), file]);
+    screenshot = (sr.code === 0 && fs.existsSync(file))
+      ? { file, target: shotTarget }
+      : { file: null, target: shotTarget, error: tail(stripAnsi(sr.stderr + sr.stdout), 4) };
+  }
+  const ok = failedChecks.length === 0 && problems.length === 0;
+  out({ ok, route, target, url: opened.url, title: opened.title, specFile,
+    theme: facts.theme, template: facts.template, waited,
+    passed: results.length - failedChecks.length, failed: failedChecks.length, checks: results,
+    problems, pageErrors: logs.pageErrors, consoleErrors: logs.consoleErrors, brokenImages: facts.brokenImages, screenshot });
+  if (!ok) process.exit(1);
 }
 
 // ---------------------------------------------------------------- commands: cart
@@ -837,6 +1084,18 @@ Dev server (shopify theme dev)
   dev start [--theme ID] [--live-reload hot-reload|full-page|off] [--wait SECONDS] [--theme-editor-sync]
   dev status | dev stop | dev restart | dev logs [--tail N]
 
+Verify (write the expectations once, assert them in one round trip)
+  verify <spec> [--route /p] [--target …] [--screenshot [--screenshot-target preview] [--full]]
+         [--wait-fn "<js>"] [--settle MS] [--retries 3]
+                              open -> wait -> assert -> check-page -> screenshot; exit 1 if anything fails
+  assert <spec|'[{…}]'|--stdin>
+                              Run the checks against the page that is already open
+                              Spec: .claude/verify-shopify/specs/<name>.json
+                              { "route", "waitFn", "settleMs", "checks": [ … ] }
+                              Check keys: exists | count | minCount | visible | textContains |
+                              textNotContains | textEquals | attr + equals/contains | css |
+                              centeredIn + tolerance | animating
+
 Browser (real Chromium via agent-browser, one isolated session per store)
   open <path|url> [--target dev|preview|live] [--retries 3]
                               Navigate; retries the Shopify dev proxy's intermittent 502 page
@@ -905,6 +1164,8 @@ function main() {
     case 'screenshot': return cmdScreenshot(ctx, rest);
     case 'record': return cmdRecord(ctx, rest);
     case 'check-page': return cmdCheckPage(ctx);
+    case 'assert': return cmdAssert(ctx, withGlobals);
+    case 'verify': return cmdVerify(ctx, withGlobals);
     case 'cart': return cmdCart(ctx, rest);
     case 'smoke': return cmdSmoke(ctx, withGlobals);
     case 'check': return cmdCheck(ctx, rest);

@@ -34,6 +34,49 @@ Tokens from `shopify store auth` expire daily. `doctor` proves the token with a 
 
 ## 1. The verification loop
 
+**Fast path — one command per surface.** Write the expectations down once as a *spec*, then let `verify` do open → settle → assert → check-page → evidence in a single call. Prefer this over hand-driving `open`/`eval`/`screenshot`; it is fewer round trips and it cannot silently "pass" on an error page.
+
+```bash
+control-shopify dev start
+control-shopify verify home --screenshot        # .claude/verify-shopify/specs/home.json
+control-shopify verify sensitive-skin           # ... /specs/sensitive-skin.json
+control-shopify smoke --target preview          # every configured route
+```
+
+A spec is JSON (`.claude/verify-shopify/specs/<name>.json`), and it stores the page's gotchas so you don't have to remember them:
+
+```jsonc
+{
+  "route": "/",
+  "waitFn": "!document.documentElement.hasAttribute('data-cz-intro')",  // intro overlay; runs before the checks
+  "settleMs": 400,                                                      // optional extra pause
+  "checks": [
+    { "name": "hero eyebrow is centred", "selector": "…__eyebrow", "centeredIn": "…__campaign_hero", "tolerance": 2 },
+    { "name": "marquee actually moves",  "selector": "…__stats_marquee", "animating": true },
+    { "name": "Reviews eyebrow is gone", "selector": "…__ugc_reviews", "textNotContains": "Reviews" },
+    { "name": "og:image",  "selector": "meta[property=\"og:image\"]", "attr": "content", "contains": "exec-b0cc" },
+    { "name": "5 cards",   "selector": "li.cz-card", "count": 5 }
+  ]
+}
+```
+
+Check vocabulary (all optional, combine freely; every check is try/caught so one bad selector cannot void the batch):
+
+| key | asserts |
+|---|---|
+| `exists` | `true` → at least one match; `false` → none |
+| `count`, `minCount` | exact / minimum number of matches |
+| `visible` | non-zero box, not `display:none`/`visibility:hidden`/`opacity:0` |
+| `textContains`, `textNotContains`, `textEquals` | text of **all** matches joined (absence checks pass with 0 matches — that is the point) |
+| `attr` + `equals` / `contains` | attribute of the first match |
+| `css: {prop: value}` | computed style of the first match |
+| `centeredIn` + `tolerance` | horizontal centre vs. that container, in px. **Use this for "is it centred"** — a screenshot cannot tell a centred element from a left-aligned one inside a centred box |
+| `animating` | a running animation with non-zero duration, scanning **every** match's subtree; reports the observed durations, so you can tell a CSS fallback from the value the JS set |
+
+`verify` exits 1 if any check fails or the page has problems; `assert <spec>` runs just the checks against the page that is already open.
+
+**Manual loop** (debugging, or exploring a surface before you write its spec):
+
 ```bash
 control-shopify dev start                          # uploads the dev theme, waits for the banner, prints preview/share/editor URLs
 control-shopify open /products/<handle>            # real Chromium, isolated session per store, retries the proxy's 502 page
@@ -68,6 +111,7 @@ Rules:
 
 ## 3. Command reference (grouped)
 
+- **Verification:** `verify <spec> [--route /p] [--target …] [--screenshot [--screenshot-target preview] [--full]] [--wait-fn "<js>"] [--settle ms]`, `assert <spec|inline JSON|--stdin>`
 - **Inspection:** `snapshot [-i -c -s <css> -u]`, `get text|html|attr|url|title|count <sel>`, `is visible|enabled <sel>`, `read`, `check-page`, `screenshot [file] [--full] [--annotate]`, `urls`
 - **Navigation:** `open <path|url> [--target …]`, `back`, `reload`, `tab …`, `scroll <dir> [px]`, `scrollintoview <sel>`
 - **Interaction:** `click|dblclick|hover|focus <sel|@ref>`, `fill|type <sel> <text>`, `press <Key>`, `select <sel> <value>`, `check|uncheck`, `find role|text|label|placeholder|testid <value> <action>`, `eval "<js>"` / `eval --stdin`, `cart add <variantId> [qty] | get | clear | open`
@@ -110,7 +154,9 @@ Building one for a new store:
 
 ## 6. Gotchas (learned on real stores)
 
-- `shopify theme dev` prints nothing for 60–120 s while it uploads; `dev start` waits up to 240 s (`--wait N`). If the port is already listening it adopts that server instead of starting a second one.
+- **The port may belong to another store.** `dev start`/`dev status`/`doctor` adopt a server that is already listening — so before using one they now fetch `/` and compare the inlined `Shopify.shop` to the configured store, and refuse on a mismatch (`Port 9292 is serving other-store.myshopify.com, not yours`). This is a real failure mode when you work on several stores: a second project's `shopify theme dev` on 9292 will otherwise be screenshotted and reported as yours, and its theme id gets written into `.shopify/verify/dev.json`, which then breaks the next real `dev start` with *"No themes on the store … match the ID"*. Give each repo its own `port` in `.claude/verify-shopify.json`, and if you hit a stale id just delete `.shopify/verify/dev.json`. Never kill the other project's server to free the port.
+- **The dev proxy 401s as well as 502s.** Alongside the 502 page it intermittently serves a bare *"The access token provided is expired, revoked, malformed…"* body **with an empty `<title>`** (the CLI session token expires daily). `open` now proves a storefront actually rendered — `Shopify.shop` present, or a body longer than a stub — instead of trusting the exit code, and retries otherwise. Without that gate every selector matches 0 elements and a run reports a confident, wrong answer. Persistent 401s: re-run `shopify theme dev` once interactively to refresh the session, or `dev restart`.
+- `shopify theme dev` prints nothing for 60–120 s while it uploads; `dev start` waits up to 240 s (`--wait N`). If the port is already listening it adopts that server — after the store-identity check above.
 - The local proxy returns **"Failed to render storefront with status 502"** intermittently, with a normal page title in agent-browser's own output. `open`/`smoke` detect it via the title and retry with backoff. Persistent 502s: `dev logs`, then `dev restart`.
 - Third-party apps (reviews, rewards, chat) log noisy console lines and inject floating widgets; filter with `consoleNoise` in the config and prefer `errors` (uncaught) over `console` for pass/fail. `--strict` makes console `[error]` lines fail too.
 - Sold-out products render disabled quantity/add buttons — pick a variant with `available: true` from `handles`. `available` comes from the Admin API and ignores markets/publications: the storefront can still say "Unavailable" for the viewer's country while `cart add` succeeds. Read the button text (`get text "button[name=add]"`) when the buy flow itself is under test.
