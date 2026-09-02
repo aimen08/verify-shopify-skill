@@ -796,9 +796,19 @@ function cmdVerifyAll(ctx, rest) {
   const names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, '')).sort();
   if (!names.length) fail(`No specs in ${dir}.`, 'Write a spec first — see SKILL.md "The loop".');
   const self = process.argv[1];
+  // A --route override is per-spec by definition; forwarding it would point every spec in the
+  // suite at one page and report confident passes for surfaces that were never opened.
+  const forwarded = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--all') continue;
+    if (a === '--route') { i++; continue; }
+    if (a.startsWith('--route=')) continue;
+    forwarded.push(a);
+  }
   const results = [];
   for (const name of names) {
-    const args = [self, 'verify', name, ...rest.filter((a) => a !== '--all')];
+    const args = [self, 'verify', name, ...forwarded];
     const r = run(process.execPath, args, { timeout: 300000, cwd: ctx.root });
     let parsed = null; try { parsed = JSON.parse(r.stdout.slice(r.stdout.indexOf('{'))); } catch {}
     results.push(parsed

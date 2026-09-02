@@ -13,7 +13,7 @@ Every command prints JSON. Failures print `{"ok":false,"error":…,"hint":…}` 
 ## Setup (once per repo)
 
 ```bash
-control-shopify init --store <shop>.myshopify.com --port 9292 --gitignore
+control-shopify init --store <shop>.myshopify.com --port <free port> --gitignore
 control-shopify doctor        # node, CLI, browser, config, dev server, theme session, token scopes
 control-shopify auth          # ONLY if doctor reports missing scopes — re-auth REPLACES the scope set
 ```
@@ -25,7 +25,7 @@ Prereqs, once per machine: `npm i -g @shopify/cli agent-browser && agent-browser
 ```bash
 control-shopify dev start
 control-shopify verify <spec> --screenshot     # open → wait → assert → check-page → PNG
-control-shopify verify --all                   # every spec, as a regression suite
+control-shopify verify --all                   # every spec, as a regression suite (--route is per-spec, so it is ignored here)
 control-shopify cleanup --keep-dev
 ```
 
