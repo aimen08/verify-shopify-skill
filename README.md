@@ -16,7 +16,10 @@ One CLI, `control-shopify`, wraps the whole thing. It is store-agnostic — each
 npm i -g @shopify/cli agent-browser && agent-browser install
 git clone git@github.com:aimen08/verify-shopify-skill.git ~/.claude/skills/verify-shopify
 ln -s ~/.claude/skills/verify-shopify/bin/control-shopify /usr/local/bin/control-shopify
+ln -s ~/.claude/skills/verify-shopify/build-shopify ~/.claude/skills/build-shopify
 ```
+
+Two skills, one binary: **verify-shopify** proves a change renders, **build-shopify** authors it. They share the config, the auth and the browser session, so the repo holds both.
 
 ## Use
 
@@ -52,8 +55,9 @@ The skill is deliberately small. Earlier versions shipped video recording, Liqui
 Screenshots are kept, with a rule: take one per surface *and read it*. DOM checks tell you pass/fail; only the picture tells you the page looks right.
 
 ```
-SKILL.md                    the skill itself — setup, the loop, spec vocabulary, gotchas
-control-shopify.mjs         the CLI
+SKILL.md                    verify — setup, the loop, spec vocabulary, gotchas
+build-shopify/SKILL.md      build — scaffolds, nav, CDN uploads, pages, shipping
+control-shopify.mjs         the CLI, shared by both
 references/
   storefront-routes.md      Shopify routes, AJAX cart endpoints, Section Rendering API
   admin-api.md              scopes + GraphQL recipes
