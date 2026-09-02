@@ -31,6 +31,16 @@ const DEFAULT_SCOPES = [
   'read_content', 'write_content',
   'read_themes',
 ];
+// Building a theme also needs menus, publications and theme writes. `auth` requests the UNION of
+// these and whatever the token already carries -- `shopify store auth` REPLACES the scope set, so a
+// re-auth computed from a fixed list silently revokes scopes granted for other work.
+const BUILD_SCOPES = [
+  ...DEFAULT_SCOPES,
+  'write_themes',
+  'read_online_store_navigation', 'write_online_store_navigation',
+  'read_publications', 'write_publications',
+  'read_online_store_pages',
+];
 const DEFAULT_ROUTES = [
   '/', '/collections/all', '/collections/{collection}', '/products/{product}',
   '/cart', '/search?q=a', '/pages/{page}',
@@ -304,13 +314,19 @@ function cmdDoctor(ctx) {
 function cmdAuth(ctx, rest) {
   const { flags } = parseArgs(rest);
   const store = requireStore(ctx);
-  const scopes = flags.scopes ? String(flags.scopes).split(',').map((s) => s.trim()).filter(Boolean) : ctx.scopes;
+  let scopes = flags.scopes ? String(flags.scopes).split(',').map((s) => s.trim()).filter(Boolean) : ctx.scopes;
+  if (flags.build) scopes = [...new Set([...scopes, ...BUILD_SCOPES])];
+  // Never hand back a token weaker than the one already in place.
+  if (!flags.exact) {
+    const current = tokenCheck(ctx, 20000);
+    if (current.ok && current.granted) scopes = [...new Set([...current.granted, ...scopes])];
+  }
   const args = ['store', 'auth', '--store', store, '--scopes', scopes.join(',')];
   if (ctx.dryRun || flags['dry-run']) { out({ ok: true, dryRun: true, command: `shopify ${args.join(' ')}`, scopes }); return; }
   warn('Opening the Shopify OAuth flow in your browser. Approve the scopes to continue.');
   const r = shopify(args, { inherit: true, timeout: 10 * 60 * 1000 });
   if (r.code !== 0) fail('shopify store auth failed', 'Run the command yourself in a terminal to see the prompt.', { command: `shopify ${args.join(' ')}` });
-  out({ ok: true, store, scopes, next: 'control-shopify doctor' });
+  out({ ok: true, store, scopes, merged: !flags.exact, next: 'control-shopify doctor' });
 }
 
 // ---------------------------------------------------------------- commands: dev server
@@ -508,20 +524,33 @@ function cmdGql(ctx, rest) {
   try { const j = JSON.parse(text); out(j); } catch { process.stdout.write(text + '\n'); }
   if (r.code !== 0) fail('shopify store execute failed', 'Check auth (`doctor`) and the query. Use --dry-run to see the command.', { stderr: tail(stripAnsi(r.stderr), 15) });
 }
-function gqlData(ctx, query, timeout = 60000, attempts = 3) {
+function gqlx(ctx, query, { variables, mutation = false, timeout = 60000, attempts = 3 } = {}) {
   let r;
+  const args = ['store', 'execute', '-s', requireStore(ctx), '-q', query, '--json'];
+  if (variables) args.push('-v', JSON.stringify(variables));
+  if (mutation) args.push('--allow-mutations');
   for (let i = 1; i <= attempts; i++) {
-    r = shopify(['store', 'execute', '-s', ctx.store, '-q', query, '--json'], { timeout });
+    r = shopify(args, { timeout });
     const transient = r.timedOut || /aborted before it completed|ETIMEDOUT|ECONNRESET|fetch failed|socket hang up/i.test(r.stdout + r.stderr);
     if (r.code === 0 || !transient || i === attempts) break;
     warn(`store execute: transient network error (attempt ${i}/${attempts}), retrying`);
     sleep(2000 * i);
   }
   let j = null; try { j = JSON.parse(stripAnsi(r.stdout).trim()); } catch {}
-  // `shopify store execute --json` prints the unwrapped `data` object; tolerate wrapped shapes too.
   const errors = j && (j.errors || (j.result && j.result.errors));
-  const data = j && (j.data || (j.result && j.result.data) || (!errors && typeof j === 'object' ? j : null));
-  return { ok: !!data && r.code === 0, data, errors, raw: tail(stripAnsi(r.stdout + r.stderr), 8) };
+  if (errors && errors.length) fail('GraphQL returned errors', 'Fix the query; `gql --dry-run` prints the exact command.', { errors });
+  const data = j && (j.data || (j.result && j.result.data) || (typeof j === 'object' ? j : null));
+  if (!data || r.code !== 0) {
+    const text = stripAnsi(r.stdout + r.stderr);
+    // A missing scope reads as a generic failure otherwise, and the fix (re-auth) is not guessable.
+    if (/access-scopes|ACCESS_DENIED|not approved to access/i.test(text)) {
+      fail('The Admin API refused this query: the token is missing a scope.',
+        'Ask the user to run: ! control-shopify auth --build    (browser; merges with the scopes already granted, so nothing is revoked). Then re-run this command.',
+        { raw: tail(text, 10) });
+    }
+    fail('shopify store execute failed', 'Check `doctor` (token + scopes) and the query.', { raw: tail(text, 12) });
+  }
+  return data;
 }
 // ---------------------------------------------------------------- commands: browser
 function baseFor(ctx, target) {
@@ -834,6 +863,17 @@ function cmdVerify(ctx, rest) {
   const route = flags.route || spec.route || '/';
   const target = flags.target || spec.target || ctx.target;
   const country = flags.country || spec.country || ctx.country;
+  // Desktop-only assertions are how mobile regressions ship. A spec can pin a viewport
+  // ("390x844") or a device name ("iPhone 12"); the emulation persists on the session, so it is
+  // always reset afterwards rather than leaking into the next spec in a --all run.
+  const viewport = flags.viewport || spec.viewport || null;
+  const device = flags.device || spec.device || null;
+  if (device) ab(ctx, ['set', 'device', String(device)]);
+  else if (viewport) {
+    const [w, h] = String(viewport).toLowerCase().split(/[x,\s]+/).map(Number);
+    if (!w || !h) fail(`Bad viewport: ${viewport}`, 'Use WxH, e.g. --viewport 390x844');
+    ab(ctx, ['set', 'viewport', String(w), String(h), ...(flags.scale ? [String(flags.scale)] : [])]);
+  }
   if (target === 'dev') {
     if (!portListening(ctx.port)) fail(`Nothing is listening on 127.0.0.1:${ctx.port}.`, 'Run `dev start` first (or --target preview|live).');
     assertOwnServer(ctx, store);
@@ -871,8 +911,9 @@ function cmdVerify(ctx, rest) {
       ? { file, target: shotTarget }
       : { file: null, target: shotTarget, error: tail(stripAnsi(sr.stderr + sr.stdout), 4) };
   }
+  if (device || viewport) ab(ctx, ['set', 'viewport', '1280', '800']);
   const ok = failedChecks.length === 0 && problems.length === 0;
-  out({ ok, route, target, country: country || null, url: opened.url, title: opened.title, specFile,
+  out({ ok, route, target, country: country || null, viewport: viewport || null, device: device || null, url: opened.url, title: opened.title, specFile,
     theme: facts.theme, template: facts.template, waited,
     passed: results.length - failedChecks.length, failed: failedChecks.length, checks: results,
     problems, pageErrors: logs.pageErrors, consoleErrors: logs.consoleErrors, brokenImages: facts.brokenImages, screenshot });
@@ -929,6 +970,429 @@ function cmdCleanup(ctx) {
 }
 
 // ---------------------------------------------------------------- help
+function cmdProfile(ctx, rest) {
+  const { flags, pos } = parseArgs(rest);
+  if (flags.from) {
+    // Summarize an existing profile JSON (no network): `profile --from .shopify/verify/evidence/<ts>-profile.json`
+    const file = path.resolve(String(flags.from));
+    const parsed = readJSON(file, null);
+    if (!parsed) fail(`Cannot read profile JSON: ${file}`);
+    out({ ok: true, from: file, summary: summarizeProfile(parsed) });
+    return;
+  }
+  requireStore(ctx);
+  const args = ['theme', 'profile', '-s', ctx.store, '--url', pos[0] || '/', '--json'];
+  const themeId = flags.theme || ctx.themeId;
+  if (themeId) args.push('-t', String(themeId));
+  if (ctx.dryRun) { out({ ok: true, dryRun: true, command: `shopify ${args.join(' ')}` }); return; }
+  const r = shopify(args, { cwd: ctx.root, timeout: 300000 });
+  const text = stripAnsi(r.stdout).trim();
+  let parsed = null; try { parsed = JSON.parse(text.slice(Math.max(0, text.indexOf('{')))); } catch {}
+  if (parsed) {
+    const file = evidencePath(ctx, `profile-${pos[0] || 'home'}`, 'json');
+    writeJSON(file, parsed);
+    const nodes = parsed.nodes || parsed.profile || null;
+    out({ ok: r.code === 0, url: pos[0] || '/', themeId, saved: file, summary: summarizeProfile(parsed), note: 'Full Speedscope-format profile saved; open it at https://www.speedscope.app or inspect the JSON.' });
+  } else { process.stdout.write(text + '\n' + stripAnsi(r.stderr)); }
+  if (r.code !== 0) process.exit(r.code);
+}
+function summarizeProfile(p) {
+  // Speedscope "evented" format as emitted by `shopify theme profile --json`:
+  // { shared: { frames: [{name}] }, profiles: [{ type: 'evented', unit: 'nanoseconds', startValue, endValue, events: [{type:'O'|'C', frame, at}] }] }
+  try {
+    const prof = p.profiles && p.profiles[0];
+    const frames = (p.shared && p.shared.frames) || p.frames;
+    if (!prof || !frames || prof.type !== 'evented') return null;
+    const div = { nanoseconds: 1e6, microseconds: 1e3, milliseconds: 1, seconds: 1e-3 }[prof.unit] || 1e6;
+    const incl = new Map(); const self = new Map(); const calls = new Map();
+    const stack = [];
+    for (const ev of prof.events) {
+      if (ev.type === 'O') stack.push({ frame: ev.frame, at: ev.at, child: 0 });
+      else if (ev.type === 'C') {
+        const o = stack.pop(); if (!o) continue;
+        const dur = ev.at - o.at;
+        const name = (frames[o.frame] && frames[o.frame].name) || String(o.frame);
+        incl.set(name, (incl.get(name) || 0) + dur);
+        self.set(name, (self.get(name) || 0) + (dur - o.child));
+        calls.set(name, (calls.get(name) || 0) + 1);
+        if (stack.length) stack[stack.length - 1].child += dur;
+      }
+    }
+    const ms = (v) => Math.round((v / div) * 100) / 100;
+    const top = [...self.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
+      .map(([name, s]) => ({ frame: name, selfMs: ms(s), inclusiveMs: ms(incl.get(name)), calls: calls.get(name) }));
+    return { totalMs: ms(prof.endValue - prof.startValue), frames: frames.length, events: prof.events.length, topBySelfTime: top };
+  } catch { return null; }
+}
+function cmdCart(ctx, rest) {
+  const { pos } = parseArgs(rest);
+  const sub = pos[0];
+  const fetchJson = (route, init) => abEval(ctx, `(async () => { const r = await fetch('${route}', ${init}); let body; try { body = await r.json(); } catch { body = await r.text(); } return JSON.stringify({ status: r.status, body }); })()`);
+  const done = (r) => { let v = r.value; if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} } out({ ok: r.ok && v && v.status < 400, ...(typeof v === 'object' ? v : { raw: v }) }); if (!(r.ok && v && v.status < 400)) process.exit(1); };
+  if (sub === 'add') {
+    const id = String(pos[1] || '').split('/').pop(); const qty = Number(pos[2] || 1);
+    if (!id) fail('cart add <variantId|gid> [qty]', 'Get variant ids from `handles`.');
+    return done(fetchJson('/cart/add.js', `{ method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify({ items: [{ id: ${Number(id)}, quantity: ${qty} }] }) }`));
+  }
+  if (sub === 'get') return done(fetchJson('/cart.js', `{ headers: { Accept: 'application/json' } }`));
+  if (sub === 'clear') return done(fetchJson('/cart/clear.js', `{ method: 'POST', headers: { Accept: 'application/json' } }`));
+  if (sub === 'open') {
+    const r = ab(ctx, ['find', 'role', 'button', 'click', '--name', 'Cart']);
+    if (r.code !== 0) fail('Could not click a button named "Cart".', 'Check the Feature Map for the cart trigger, or `open /cart`.', { stderr: tail(stripAnsi(r.stderr + r.stdout), 5) });
+    ab(ctx, ['wait', '500']);
+    out({ ok: true, note: 'Clicked the Cart button; run `snapshot` to see the drawer.' }); return;
+  }
+  fail('cart add <variantId> [qty] | cart get | cart clear | cart open');
+}
+// ---------------------------------------------------------------- build: onboarding
+// One command from "here is a store URL" to "the agent can build": config, admin token, theme
+// session, dev server. Each step reports what it did and what a human still has to do, because the
+// two OAuth flows need a browser and cannot be completed from a non-TTY shell.
+function cmdSetup(ctx, rest) {
+  const { flags } = parseArgs(rest);
+  const store = normalizeStore(flags.store || ctx.store);
+  if (!store) fail('No store.', 'control-shopify setup --store <shop>.myshopify.com');
+  const steps = [];
+  if (!fs.existsSync(ctx.configFile) || flags.force) {
+    const initArgs = ['--store', store, ...(flags.port ? ['--port', String(flags.port)] : []), '--gitignore', ...(flags.force ? ['--force'] : [])];
+    const r = run(process.execPath, [process.argv[1], 'init', ...initArgs], { timeout: 60000, cwd: ctx.root });
+    steps.push({ step: 'config', ok: r.code === 0, file: ctx.configFile });
+  } else steps.push({ step: 'config', ok: true, file: ctx.configFile, note: 'already present' });
+
+  const ctx2 = buildContext({ ...flags, store });
+  const tok = tokenCheck(ctx2, 30000);
+  const wanted = flags.build === false ? ctx2.scopes : [...new Set([...ctx2.scopes, ...BUILD_SCOPES])];
+  const missing = tok.ok ? missingScopes(wanted, tok.granted) : wanted;
+  steps.push({ step: 'adminToken', ok: tok.ok && missing.length === 0, shop: tok.shop, missing: missing.length ? missing : undefined,
+    action: (!tok.ok || missing.length) ? `control-shopify auth --build   (browser; merges with the ${tok.granted ? tok.granted.length : 0} scopes already granted)` : undefined });
+
+  const tl = run('shopify', ['theme', 'list', '--store', store], { timeout: 25000 });
+  const themeOk = tl.code === 0 && !/log in to Shopify|operation was aborted/i.test(stripAnsi(tl.stdout + tl.stderr));
+  steps.push({ step: 'themeSession', ok: themeOk,
+    action: themeOk ? undefined : `ask the user to run this once, interactively: ! shopify theme list --store ${store}` });
+
+  const ready = steps.every((x) => x.ok);
+  out({ ok: ready, store, steps,
+    next: ready ? ['control-shopify dev start', 'control-shopify products list --limit 5', 'control-shopify nav list']
+                : steps.filter((x) => !x.ok && x.action).map((x) => x.action) });
+  if (!ready) process.exit(1);
+}
+
+// ---------------------------------------------------------------- build: theme lifecycle
+function publishedThemeId(ctx) {
+  const d = gqlx(ctx, '{ themes(first: 1, roles: MAIN) { nodes { id name } } }', { timeout: 30000 });
+  const n = d && d.themes && d.themes.nodes && d.themes.nodes[0];
+  return n ? { id: String(n.id).split('/').pop(), name: n.name } : null;
+}
+function cmdTheme(ctx, rest) {
+  const { flags, pos } = parseArgs(rest);
+  const sub = pos[0];
+  const store = requireStore(ctx);
+  if (sub === 'new') {
+    const name = pos[1] || flags.name;
+    if (!name) fail('Missing theme name.', 'control-shopify theme new <name> [--clone <git url>]');
+    const dir = flags.dir || path.join(ctx.root, name);
+    const args = ['theme', 'init', '--path', dir, ...(flags.clone ? ['--clone-url', String(flags.clone)] : [])];
+    if (ctx.dryRun) { out({ ok: true, dryRun: true, command: `shopify ${args.join(' ')}` }); return; }
+    const r = shopify(args, { inherit: true, timeout: 10 * 60 * 1000 });
+    if (r.code !== 0) fail('theme init failed', 'Run it yourself to see the prompt.', { command: `shopify ${args.join(' ')}` });
+    out({ ok: true, created: dir, next: [`cd ${dir}`, 'control-shopify setup --store ' + store] });
+    return;
+  }
+  if (sub === 'list') {
+    const d = gqlx(ctx, '{ themes(first: 50) { nodes { id name role updatedAt } } }', { timeout: 45000 });
+    out({ ok: true, themes: (d.themes.nodes || []).map((t) => ({ id: String(t.id).split('/').pop(), name: t.name, role: t.role, updatedAt: t.updatedAt })) });
+    return;
+  }
+  if (sub === 'pull') {
+    const args = ['theme', 'pull', '--store', store, ...(flags.theme ? ['--theme', String(flags.theme)] : ['--development'])];
+    if (ctx.dryRun) { out({ ok: true, dryRun: true, command: `shopify ${args.join(' ')}` }); return; }
+    const r = shopify(args, { timeout: 10 * 60 * 1000, cwd: ctx.root });
+    out({ ok: r.code === 0, command: `shopify ${args.join(' ')}`, output: tail(stripAnsi(r.stdout + r.stderr), 12) });
+    if (r.code !== 0) process.exit(1);
+    return;
+  }
+  if (sub === 'push' || sub === 'share') {
+    // Pushing to the published theme edits the live storefront. Refuse unless the caller says so in
+    // as many words; --unpublished (the default for `share`) is always safe.
+    const live = publishedThemeId(ctx);
+    const targetId = flags.theme ? String(flags.theme) : null;
+    const toLive = flags.live || (targetId && live && targetId === live.id);
+    if (toLive && !flags.yes) {
+      fail(`Refusing to push to the PUBLISHED theme (${live ? live.name + ' #' + live.id : 'unknown'}).`,
+        'That edits the live storefront. Re-run with --live --yes if that is genuinely intended, or use `theme share` to push an unpublished copy.');
+    }
+    const unpublished = sub === 'share' || flags.unpublished || (!targetId && !toLive);
+    const args = ['theme', 'push', '--store', store, ...(flags.json === false ? [] : []),
+      ...(targetId ? ['--theme', targetId] : []), ...(unpublished ? ['--unpublished'] : []),
+      ...(flags['theme-name'] ? ['--theme-name', String(flags['theme-name'])] : []),
+      ...(flags.only ? ['--only', String(flags.only)] : []), ...(flags.nodelete ? ['--nodelete'] : [])];
+    if (ctx.dryRun) { out({ ok: true, dryRun: true, command: `shopify ${args.join(' ')}`, wouldTarget: unpublished ? 'a NEW unpublished theme' : targetId }); return; }
+    const r = shopify(args, { timeout: 20 * 60 * 1000, cwd: ctx.root });
+    const text = stripAnsi(r.stdout + r.stderr);
+    const idm = text.match(/themes\/(\d+)/) || text.match(/#(\d{9,})/);
+    const id = idm ? idm[1] : null;
+    out({ ok: r.code === 0, target: unpublished ? 'unpublished' : (targetId || 'current'), themeId: id,
+      previewUrl: id ? `https://${store}/?preview_theme_id=${id}` : null,
+      editorUrl: id ? `https://${store}/admin/themes/${id}/editor` : null,
+      output: tail(text, 12) });
+    if (r.code !== 0) process.exit(1);
+    return;
+  }
+  fail(`Unknown theme subcommand: ${sub || '(none)'}`, 'theme new|list|pull|push|share  (dev server: `dev start`)');
+}
+
+// ---------------------------------------------------------------- build: store content
+// Everything here exists so the agent stops guessing handles, menu shapes and image URLs. Reads are
+// free; every write is gated behind --yes and prints the plan first.
+function requireYes(ctx, flags, what) {
+  if (ctx.dryRun) return false;
+  if (!flags.yes) fail(`Refusing to ${what} without --yes.`, 'Re-run with --yes once the user has approved the change. `--dry-run` prints the exact mutation.');
+  return true;
+}
+function cmdNav(ctx, rest) {
+  const { flags, pos } = parseArgs(rest);
+  const sub = pos[0] || 'list';
+  if (sub === 'list') {
+    const d = gqlx(ctx, '{ menus(first: 50) { nodes { id handle title items { id } } } }', { timeout: 45000 });
+    out({ ok: true, menus: (d.menus.nodes || []).map((m) => ({ id: m.id, handle: m.handle, title: m.title, topLevelItems: (m.items || []).length })) });
+    return;
+  }
+  if (sub === 'get') {
+    const handle = pos[1] || flags.handle;
+    if (!handle) fail('Missing menu handle.', 'control-shopify nav get main-menu');
+    const q = `{ menu(handle: "${handle}") { id handle title items { id title type url resourceId items { id title type url resourceId items { id title type url resourceId } } } } }`;
+    const d = gqlx(ctx, q, { timeout: 45000 });
+    if (!d.menu) fail(`No menu with handle "${handle}".`, 'control-shopify nav list');
+    out({ ok: true, menu: d.menu });
+    return;
+  }
+  if (sub === 'set') {
+    const handle = pos[1] || flags.handle;
+    const src = flags.items;
+    if (!handle || !src) fail('Missing handle or items.', 'control-shopify nav set main-menu --items @menu.json [--title "Main menu"] --yes');
+    const items = String(src).startsWith('@') ? readJSON(path.resolve(ctx.root, String(src).slice(1)), null) : JSON.parse(String(src));
+    if (!Array.isArray(items)) fail('items must be a JSON array of { title, type, url|resourceId, items? }.');
+    const cur = gqlx(ctx, `{ menu(handle: "${handle}") { id title } }`, { timeout: 30000 });
+    if (!cur.menu) fail(`No menu with handle "${handle}".`, 'control-shopify nav list');
+    const title = flags.title || cur.menu.title;
+    const mutation = `mutation($id: ID!, $title: String!, $handle: String!, $items: [MenuItemUpdateInput!]!) {
+      menuUpdate(id: $id, title: $title, handle: $handle, items: $items) {
+        menu { id handle itemsCount } userErrors { field message } } }`;
+    const vars = { id: cur.menu.id, title, handle, items };
+    if (ctx.dryRun) { out({ ok: true, dryRun: true, mutation: 'menuUpdate', variables: vars }); return; }
+    requireYes(ctx, flags, `rewrite the "${handle}" menu (${items.length} top-level items)`);
+    const d = gqlx(ctx, mutation, { timeout: 60000, variables: vars, mutation: true });
+    const errs = d.menuUpdate && d.menuUpdate.userErrors;
+    if (errs && errs.length) fail('menuUpdate returned userErrors', 'Fix the item shapes and retry.', { userErrors: errs });
+    out({ ok: true, menu: d.menuUpdate.menu });
+    return;
+  }
+  fail(`Unknown nav subcommand: ${sub}`, 'nav list | nav get <handle> | nav set <handle> --items @file.json --yes');
+}
+
+// Upload order and the PUT trick are load-bearing; see references/admin-api.md.
+function cmdFiles(ctx, rest) {
+  const { flags, pos } = parseArgs(rest);
+  const sub = pos[0] || 'list';
+  if (sub === 'list') {
+    const q = flags.query ? `, query: ${JSON.stringify(String(flags.query))}` : '';
+    const d = gqlx(ctx, `{ files(first: ${Number(flags.limit || 25)}${q}, sortKey: CREATED_AT, reverse: true) { nodes { id alt fileStatus createdAt
+      ... on MediaImage { image { url width height } } ... on GenericFile { url } } } }`, { timeout: 60000 });
+    out({ ok: true, files: d.files.nodes || [] });
+    return;
+  }
+  if (sub === 'upload') {
+    const paths = pos.slice(1).map((f) => path.resolve(ctx.root, f));
+    if (!paths.length) fail('No files given.', 'control-shopify files upload a.jpg b.jpg [--alt "text"] --yes');
+    for (const f of paths) if (!fs.existsSync(f)) fail(`No such file: ${f}`);
+    const alts = flags.alt ? String(flags.alt).split('||') : [];
+    // Alt is how GIDs are mapped back to inputs later; duplicates silently cross-wire.
+    const altFor = (f, i) => (alts[i] || alts[0] || path.basename(f, path.extname(f))).slice(0, 512);
+    const seen = new Set();
+    for (let i = 0; i < paths.length; i++) {
+      const a = altFor(paths[i], i);
+      if (seen.has(a)) fail(`Duplicate alt text: ${a}`, 'Alt must be unique per upload — GIDs are mapped back by alt. Pass --alt "a||b||c".');
+      seen.add(a);
+    }
+    const inputs = paths.map((f) => ({ filename: path.basename(f), mimeType: mimeFor(f), resource: 'FILE', httpMethod: 'PUT', fileSize: String(fs.statSync(f).size) }));
+    if (ctx.dryRun) { out({ ok: true, dryRun: true, wouldUpload: inputs }); return; }
+    requireYes(ctx, flags, `upload ${paths.length} file(s) to the store's CDN`);
+    const staged = gqlx(ctx, `mutation($input: [StagedUploadInput!]!) { stagedUploadsCreate(input: $input) {
+      stagedTargets { url resourceUrl } userErrors { field message } } }`, { timeout: 120000, variables: { input: inputs }, mutation: true });
+    const se = staged.stagedUploadsCreate.userErrors;
+    if (se && se.length) fail('stagedUploadsCreate failed', 'Check mimeType/fileSize.', { userErrors: se });
+    const targets = staged.stagedUploadsCreate.stagedTargets;
+    const uploaded = [];
+    for (let i = 0; i < paths.length; i++) {
+      const t = targets[i];
+      const r = run('curl', ['-sS', '-X', 'PUT', '-T', paths[i], '-H', `Content-Type: ${inputs[i].mimeType}`, t.url], { timeout: 300000 });
+      if (r.code !== 0) fail(`Upload failed for ${paths[i]}`, tail(r.stderr, 4));
+      // resourceUrl is the signed URL minus its query string.
+      uploaded.push({ originalSource: t.resourceUrl || t.url.split('?')[0], alt: altFor(paths[i], i), contentType: inputs[i].mimeType.startsWith('image/') ? 'IMAGE' : 'FILE' });
+    }
+    const created = gqlx(ctx, `mutation($files: [FileCreateInput!]!) { fileCreate(files: $files) {
+      files { id alt fileStatus ... on MediaImage { image { url } } ... on GenericFile { url } } userErrors { field message } } }`, { timeout: 120000, variables: { files: uploaded }, mutation: true });
+    const ce = created.fileCreate.userErrors;
+    if (ce && ce.length) fail('fileCreate failed', 'Check the staged resourceUrls.', { userErrors: ce });
+    // Files are UPLOADED before they are READY; referencing one too early renders a broken image.
+    let files = created.fileCreate.files;
+    const ids = files.map((f) => f.id);
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (files.every((f) => f.fileStatus === 'READY')) break;
+      const d = gqlx(ctx, `query($ids: [ID!]!) { nodes(ids: $ids) { ... on MediaImage { id alt fileStatus image { url } } ... on GenericFile { id alt fileStatus url } } }`, { timeout: 60000, variables: { ids } });
+      files = d.nodes.filter(Boolean);
+      if (files.every((f) => f.fileStatus === 'READY')) break;
+      run('sh', ['-c', 'sleep 3'], { timeout: 10000 });
+    }
+    out({ ok: true, uploaded: files.length, ready: files.filter((f) => f.fileStatus === 'READY').length,
+      files: files.map((f) => ({ id: f.id, alt: f.alt, status: f.fileStatus, url: (f.image && f.image.url) || f.url })),
+      note: 'Reference these only while fileStatus is READY. In Liquid, a file_reference metafield or shopify://shop_images/<name>.' });
+    return;
+  }
+  fail(`Unknown files subcommand: ${sub}`, 'files list [--query q] | files upload <path...> --yes');
+}
+function mimeFor(f) {
+  const e = path.extname(f).toLowerCase();
+  return ({ '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif',
+    '.svg': 'image/svg+xml', '.mp4': 'video/mp4', '.pdf': 'application/pdf', '.css': 'text/css', '.js': 'text/javascript',
+    '.json': 'application/json', '.woff': 'font/woff', '.woff2': 'font/woff2' })[e] || 'application/octet-stream';
+}
+
+function cmdCatalog(ctx, rest, kind) {
+  const { flags, pos } = parseArgs(rest);
+  const sub = pos[0] || 'list';
+  const limit = Number(flags.limit || 25);
+  const q = flags.query ? `, query: ${JSON.stringify(String(flags.query))}` : '';
+  if (kind === 'products' && sub === 'list') {
+    const d = gqlx(ctx, `{ products(first: ${limit}${q}) { nodes { handle title status templateSuffix totalInventory
+      featuredMedia { ... on MediaImage { image { url } } }
+      variants(first: 3) { nodes { id sku price inventoryQuantity } } } } }`, { timeout: 90000 });
+    out({ ok: true, products: (d.products.nodes || []).map((p) => ({ ...p, variants: p.variants.nodes })) });
+    return;
+  }
+  if (kind === 'collections' && sub === 'list') {
+    const d = gqlx(ctx, `{ collections(first: ${limit}${q}) { nodes { handle title productsCount { count } templateSuffix } } }`, { timeout: 60000 });
+    out({ ok: true, collections: d.collections.nodes || [] });
+    return;
+  }
+  if (kind === 'pages' && sub === 'list') {
+    const d = gqlx(ctx, `{ pages(first: ${Math.max(limit, 100)}${q}) { nodes { id handle title templateSuffix } } }`, { timeout: 60000 });
+    const nodes = d.pages.nodes || [];
+    out({ ok: true, count: nodes.length, pages: flags.all ? nodes : nodes.slice(0, limit) });
+    return;
+  }
+  if (kind === 'pages' && (sub === 'create' || sub === 'update')) {
+    const handle = pos[1] || flags.handle;
+    if (!handle) fail('Missing handle.', `control-shopify pages ${sub} <handle> --title "T" [--template-suffix s] [--body @file.html] --yes`);
+    const body = flags.body ? (String(flags.body).startsWith('@') ? fs.readFileSync(path.resolve(ctx.root, String(flags.body).slice(1)), 'utf8') : String(flags.body)) : undefined;
+    const input = { handle, ...(flags.title ? { title: String(flags.title) } : {}),
+      ...(flags['template-suffix'] !== undefined ? { templateSuffix: String(flags['template-suffix']) } : {}),
+      ...(body !== undefined ? { body } : {}), ...(flags.published !== undefined ? { isPublished: flags.published !== 'false' } : {}) };
+    if (sub === 'create') {
+      if (!input.title) fail('create needs --title.');
+      if (ctx.dryRun) { out({ ok: true, dryRun: true, mutation: 'pageCreate', variables: { page: input } }); return; }
+      requireYes(ctx, flags, `create the page /pages/${handle}`);
+      const d = gqlx(ctx, 'mutation($page: PageCreateInput!) { pageCreate(page: $page) { page { id handle title templateSuffix } userErrors { field message } } }', { timeout: 60000, variables: { page: input }, mutation: true });
+      const e = d.pageCreate.userErrors; if (e && e.length) fail('pageCreate failed', '', { userErrors: e });
+      out({ ok: true, page: d.pageCreate.page, url: `https://${ctx.store}/pages/${handle}` });
+      return;
+    }
+    const cur = gqlx(ctx, `{ pages(first: 1, query: "handle:${handle}") { nodes { id } } }`, { timeout: 30000 });
+    const node = cur.pages.nodes && cur.pages.nodes[0];
+    if (!node) fail(`No page with handle "${handle}".`, 'control-shopify pages list --all');
+    delete input.handle;
+    if (ctx.dryRun) { out({ ok: true, dryRun: true, mutation: 'pageUpdate', variables: { id: node.id, page: input } }); return; }
+    requireYes(ctx, flags, `update the page /pages/${handle}`);
+    const d = gqlx(ctx, 'mutation($id: ID!, $page: PageUpdateInput!) { pageUpdate(id: $id, page: $page) { page { id handle title templateSuffix } userErrors { field message } } }', { timeout: 60000, variables: { id: node.id, page: input }, mutation: true });
+    const e = d.pageUpdate.userErrors; if (e && e.length) fail('pageUpdate failed', '', { userErrors: e });
+    out({ ok: true, page: d.pageUpdate.page, url: `https://${ctx.store}/pages/${handle}` });
+    return;
+  }
+  fail(`Unknown ${kind} subcommand: ${sub}`, kind === 'pages' ? 'pages list | pages create <handle> --title T --yes | pages update <handle> …' : `${kind} list [--query q] [--limit n]`);
+}
+
+// ---------------------------------------------------------------- build: scaffolds
+// A section is mostly boilerplate plus a schema whose shape is easy to get subtly wrong (settings
+// vs blocks, presets, the id/type contract). Generate it rather than retyping it from memory.
+function cmdNew(ctx, rest, kind) {
+  const { flags, pos } = parseArgs(rest);
+  const name = pos[0] || flags.name;
+  if (!name) fail(`Missing name.`, `control-shopify ${kind} new <name>`);
+  const slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const title = flags.title || slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  const dir = path.join(ctx.root, kind === 'section' ? 'sections' : 'snippets');
+  const file = path.join(dir, `${slug}.liquid`);
+  if (fs.existsSync(file) && !flags.force) fail(`Already exists: ${file}`, 'Pass --force to overwrite.');
+  let body;
+  if (kind === 'snippet') {
+    body = `{%- comment -%}
+  ${title}
+  Usage: {% render '${slug}', product: product %}
+{%- endcomment -%}
+
+<div class="${slug}">
+</div>
+`;
+  } else {
+    const cls = slug;
+    body = `{%- assign sid = section.id -%}
+<section id="${cls}-{{ sid }}" class="${cls}">
+  <div class="${cls}__inner">
+    {%- if section.settings.heading != blank -%}
+      <h2 class="${cls}__heading">{{ section.settings.heading }}</h2>
+    {%- endif -%}
+
+    {%- if section.blocks.size > 0 -%}
+      <div class="${cls}__items">
+        {%- for block in section.blocks -%}
+          <div class="${cls}__item" {{ block.shopify_attributes }}>
+            {{ block.settings.text }}
+          </div>
+        {%- endfor -%}
+      </div>
+    {%- endif -%}
+  </div>
+</section>
+
+<style>
+  #${cls}-{{ sid }} {
+    background: {{ section.settings.bg_color }};
+    color: {{ section.settings.text_color }};
+    padding: {{ section.settings.padding_top }}px 20px {{ section.settings.padding_bottom }}px;
+  }
+  #${cls}-{{ sid }} .${cls}__inner { max-width: 1200px; margin: 0 auto; }
+</style>
+
+{% schema %}
+{
+  "name": "${title}",
+  "tag": "section",
+  "settings": [
+    { "type": "text", "id": "heading", "label": "Heading", "default": "${title}" },
+    { "type": "color", "id": "bg_color", "label": "Background", "default": "#ffffff" },
+    { "type": "color", "id": "text_color", "label": "Text", "default": "#15171b" },
+    { "type": "range", "id": "padding_top", "label": "Padding top", "min": 0, "max": 120, "step": 4, "unit": "px", "default": 48 },
+    { "type": "range", "id": "padding_bottom", "label": "Padding bottom", "min": 0, "max": 120, "step": 4, "unit": "px", "default": 48 }
+  ],
+  "blocks": [
+    { "type": "item", "name": "Item", "settings": [
+      { "type": "text", "id": "text", "label": "Text", "default": "Item" }
+    ] }
+  ],
+  "presets": [ { "name": "${title}", "blocks": [ { "type": "item" }, { "type": "item" } ] } ]
+}
+{% endschema %}
+`;
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, body);
+  out({ ok: true, created: path.relative(ctx.root, file), kind, name: slug,
+    next: kind === 'section'
+      ? ['add it to a template JSON or a section group', 'control-shopify dev start', `control-shopify verify <spec>  # assert .${slug} renders`]
+      : [`{% render '${slug}' %}`] });
+}
+
 function help() {
   process.stdout.write(`control-shopify v${VERSION} — verification CLI for Shopify theme work
 
@@ -940,21 +1404,24 @@ Setup & health
   init --store <shop>.myshopify.com [--port 9292] [--primary-domain https://…] [--gitignore] [--force]
   doctor                      node, shopify CLI (+ shadowing installs), agent-browser, config,
                               dev server identity, theme session, store token + scopes
-  auth [--scopes a,b] [--dry-run]     shopify store auth (interactive; re-auth REPLACES scopes)
+  auth [--build] [--scopes a,b] [--exact] [--dry-run]
+                              shopify store auth. Merges with the scopes already granted so a
+                              re-auth cannot revoke them (--exact opts out). --build adds menus,
+                              publications and theme writes.
   urls                        dev / preview / live / editor URLs
 
 Dev server
   dev start [--theme ID] [--wait SECONDS] | dev status | stop | restart | logs [--tail N]
 
 Verify — the loop
-  verify <spec> [--route /p] [--target …] [--country US] [--screenshot [--full]]
-         [--wait-fn "<js>"] [--settle MS] [--retries 3]
+  verify <spec> [--route /p] [--target …] [--country US] [--viewport 390x844 | --device "iPhone 12"]
+         [--screenshot [--full]] [--wait-fn "<js>"] [--settle MS] [--retries 3]
                               open -> wait -> assert -> check-page -> screenshot; exit 1 on any failure
   verify --all [--target …]   Run every spec in .claude/verify-shopify/specs/ as a regression suite
   assert <spec|'[{…}]'|--stdin>       Check the page that is already open
 
   Spec: .claude/verify-shopify/specs/<name>.json
-        { "route", "country", "waitFn", "settleMs", "checks": [ … ] }
+        { "route", "country", "viewport"|"device", "waitFn", "settleMs", "checks": [ … ] }
         Check keys: exists | count | minCount | visible | textContains | textNotContains |
                     textEquals | attr + equals/contains | css | centeredIn + tolerance | animating
 
@@ -972,6 +1439,33 @@ Lint
 
 Admin API
   gql '<query>' | gql @file.graphql [--variables '{…}'|@vars.json] [--allow-mutations] [--dry-run]
+
+Build — store content (reads are free; every write needs --yes, and --dry-run prints the mutation)
+  setup --store <shop>.myshopify.com [--port N]
+                              One shot: config + admin token + theme session + what a human must do
+  theme new <name> [--clone <git url>] | theme list | theme pull | theme push | theme share
+                              'share' pushes an UNPUBLISHED copy and prints its preview URL.
+                              Pushing to the published theme is refused without --live --yes.
+  nav list | nav get <handle> | nav set <handle> --items @menu.json [--title T] --yes
+  files list [--query q] [--limit n]
+  files upload <path...> [--alt "A||B"] --yes
+                              stagedUploadsCreate(PUT) -> upload -> fileCreate -> wait for READY.
+                              Alt must be unique: GIDs are mapped back by alt, not by index.
+  products list [--query q] [--limit n]      handles, SKUs, variant ids, stock — stop guessing
+  collections list [--query q] [--limit n]
+  pages list [--all] | pages create <handle> --title T [--template-suffix s] [--body @f.html] --yes
+                                           | pages update <handle> … --yes
+
+Build — scaffolds
+  section new <name> [--title T] [--force]   sections/<slug>.liquid with a working schema + preset
+  snippet new <name>                          snippets/<slug>.liquid
+
+Perf
+  profile [/path] [--theme ID] | profile --from <file.json>
+                              Liquid render profile + self-time summary, saved to evidence/
+
+Cart
+  cart add <variantId> [qty] | cart get | cart clear | cart open
 
 Cleanup
   cleanup [--keep-dev]        Close the browser session and stop the dev server
@@ -1012,6 +1506,17 @@ function main() {
     case 'assert': return cmdAssert(ctx, withGlobals);
     case 'verify': return cmdVerify(ctx, withGlobals);
     case 'check': return cmdCheck(ctx, rest);
+    case 'profile': return cmdProfile(ctx, withGlobals);
+    case 'cart': return cmdCart(ctx, rest);
+    case 'setup': return cmdSetup(ctx, withGlobals);
+    case 'theme': return cmdTheme(ctx, withGlobals);
+    case 'nav': return cmdNav(ctx, withGlobals);
+    case 'files': return cmdFiles(ctx, withGlobals);
+    case 'products': return cmdCatalog(ctx, withGlobals, 'products');
+    case 'collections': return cmdCatalog(ctx, withGlobals, 'collections');
+    case 'pages': return cmdCatalog(ctx, withGlobals, 'pages');
+    case 'section': return cmdNew(ctx, rest.slice(1), 'section');
+    case 'snippet': return cmdNew(ctx, rest.slice(1), 'snippet');
     case 'cleanup': return cmdCleanup(ctx);
     default:
       if (PASSTHROUGH.has(cmd)) {

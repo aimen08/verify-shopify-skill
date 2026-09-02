@@ -59,6 +59,8 @@ A spec is JSON at `.claude/verify-shopify/specs/<name>.json`:
 | `centeredIn` + `tolerance` | horizontal centre vs. that container, in px — **use this for "is it centred"**; a screenshot cannot tell a centred element from a left-aligned one inside a centred box |
 | `animating` | a running animation with non-zero duration, scanning every match's subtree |
 
+Two more spec keys matter as much as the checks: `country` pins the market (see gotchas) and `viewport: "390x844"` / `device: "iPhone 12"` pins the screen. Desktop-only assertions are how mobile regressions ship — emulation is reset after each spec, so a `--all` run can mix widths freely.
+
 Specs are the thing that compounds: they stay as regression tests, and `verify --all` re-runs them free after the next change.
 
 ## When a check fails
@@ -118,5 +120,7 @@ Mutations are refused unless you pass `--allow-mutations`; `--dry-run` prints th
 `.claude/verify-shopify/features/README.md` — materialized memory for a store's theme. Record **only what you had to discover**: selectors, click paths, DOM hooks, and gotchas that cost you time. Not prose descriptions of what a section is; the code already says that.
 
 Good entries look like: *"no `button[name=add]` on this template, it's `[data-arp-atc]`"*, *"the cap `break` runs before the skip checks, so absence checks pass vacuously"*, *"dev renders ES, live renders US"*.
+
+Building rather than verifying? The **`build-shopify`** skill covers the other half with the same CLI: scaffolds, navigation, CDN uploads, pages, and shipping to an unpublished theme.
 
 References: `references/storefront-routes.md` (URL/AJAX/Section Rendering map), `references/admin-api.md` (scopes + GraphQL recipes), `references/feature-map-template.md`, `references/browser-tooling.md`.
