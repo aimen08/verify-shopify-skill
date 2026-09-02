@@ -1,7 +1,7 @@
 ---
 name: verify-shopify
 description: Verification loop for Shopify theme work on any store. Runs `shopify theme dev`, drives the storefront in a real Chromium (agent-browser), asserts the DOM against reusable JSON specs, and reaches the Admin GraphQL API through `shopify store execute`. Use whenever you change a Shopify theme and must prove it works, reproduce a storefront bug, or find real product/page fixtures to test against.
-allowed-tools: Bash(control-shopify:*), Bash(node /Users/mac/.claude/skills/verify-shopify/control-shopify.mjs:*), Bash(agent-browser:*), Bash(shopify:*)
+allowed-tools: Bash(control-shopify:*), Bash(node ~/.claude/skills/verify-shopify/control-shopify.mjs:*), Bash(agent-browser:*), Bash(shopify:*)
 ---
 
 # verify-shopify

@@ -17,7 +17,7 @@ verify  →   control-shopify verify <spec> · eval · screenshot · check · pr
 
 ```bash
 npm i -g @shopify/cli agent-browser && agent-browser install
-git clone git@github.com:aimen08/verify-shopify-skill.git ~/.claude/skills/verify-shopify
+git clone https://github.com/aimen08/verify-shopify-skill.git ~/.claude/skills/verify-shopify
 ln -s ~/.claude/skills/verify-shopify/bin/control-shopify /usr/local/bin/control-shopify
 ln -s ~/.claude/skills/verify-shopify/build-shopify ~/.claude/skills/build-shopify
 ```
@@ -96,6 +96,16 @@ references/
   browser-tooling.md        why agent-browser; headless-Chrome fallback
 ```
 
+## Contributing
+
+Issues and PRs welcome. The rule that keeps this small: a command earns its place by being used in a real session, and the docs are the expensive part — `SKILL.md` is what loads into an agent's context, so a feature that needs a paragraph of explanation had better save more than a paragraph of work. If you worked around a command by hand, that is a bug in the command.
+
+Tested against Shopify CLI 4.x on macOS and Linux. Requires Node 20+.
+
 ## Maintaining
 
 After any surprise: `doctor` → `verify --all` → write the gotcha into the SKILL.md it belongs to and the store's Feature Map. If you worked around a command by hand, fix the command — agents should run a CLI command, not write throwaway scripts.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,7 +1,7 @@
 ---
 name: build-shopify
 description: Build Shopify themes and store content with concrete commands instead of guesses — scaffold a theme or section, read and rewrite navigation menus, upload images to the store CDN, create and update pages, list real product/collection/page handles, push to an unpublished theme, and profile Liquid render cost. Use when authoring or changing a Shopify theme, adding a section or landing page, wiring menus, or shipping theme work. Pairs with verify-shopify, which proves the result renders.
-allowed-tools: Bash(control-shopify:*), Bash(node /Users/mac/.claude/skills/verify-shopify/control-shopify.mjs:*), Bash(shopify:*), Bash(agent-browser:*)
+allowed-tools: Bash(control-shopify:*), Bash(node ~/.claude/skills/verify-shopify/control-shopify.mjs:*), Bash(shopify:*), Bash(agent-browser:*)
 ---
 
 # build-shopify
@@ -116,4 +116,4 @@ Write a spec for every surface you build — it costs a minute and becomes the r
 - **A missing scope reads as a generic API failure.** The CLI detects it and tells you to run `auth --build`; believe it rather than rewriting the query.
 - Theme JSON templates are rewritten by Shopify's editor, so a live template will never md5-match your local copy. Compare them semantically.
 
-Reference: `~/.claude/skills/verify-shopify/references/admin-api.md` (scopes, fixture-finding, staged uploads), `storefront-routes.md` (routes, AJAX cart, Section Rendering).
+Reference: `../references/admin-api.md` (scopes, fixture-finding, staged uploads), `storefront-routes.md` (routes, AJAX cart, Section Rendering).
